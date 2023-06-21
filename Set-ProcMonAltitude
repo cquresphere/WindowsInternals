@@ -1,0 +1,41 @@
+<#.
+    Change Procmon altitude to get full visibility of what is going on host
+    Based on article:
+    https://techcommunity.microsoft.com/t5/ask-the-performance-team/change-altitude-of-process-monitor-procmon/ba-p/2118159
+#>
+
+$Altitude = 40000 # default 385200
+
+$ProcMonSvcRegKey = "HKLM:\SYSTEM\CurrentControlSet\Services\"
+
+$IsRegKeyPresent = Get-ChildItem -Path $ProcMonSvcRegKey | Where-Object { $_.PSChildName -like "PROCMON*" }
+$Number = ($IsRegKeyPresent.PSChildName).Split("N")[1]
+
+if ($IsRegKeyPresent) {
+    $FullPathToProperty = $ProcMonSvcRegKey + "$($IsRegKeyPresent.PSChildName)" + "\" + "Instances\Process Monitor $Number Instance"
+    # Set Altitude value
+    Set-ItemProperty -Path $FullPathToProperty -Name Altitude -Value $Altitude
+
+    # Get Everyone group local language name by converting SID to group name
+    $SID = New-Object System.Security.Principal.SecurityIdentifier("S-1-1-0")
+    # Use Translate to find user from sid
+    $objUser = $SID.Translate([System.Security.Principal.NTAccount])
+    # Get the converted SID to username value
+    $EveryoneGroupName = $objUser.Value
+  
+    
+    $NewAcl = Get-Acl -Path $FullPathToProperty
+    $identity = [System.Security.Principal.NTAccount]("$EveryoneGroupName")
+    $regKeyRights = "SetValue,Delete"
+    $actype = [System.Security.AccessControl.AccessControlType]::Deny
+    $inhFlags = 'ContainerInherit, ObjectInherit'
+    $prFlags = [System.Security.AccessControl.PropagationFlags]::None
+    $regKeyAccessRule = New-Object System.Security.AccessControl.RegistryAccessRule ($identity, $regKeyRights, $inhFlags, $prFlags, $actype)
+    $NewAcl.SetAccessRule($regKeyAccessRule)
+    $NewAcl.SetAccessRuleProtection( $true, $false ) # True, True - Convert Inherited permissions form this object | True False Remove all inherited permissions from this object
+    
+    #Set permissions
+    Set-Acl -Path $FullPathToProperty -AclObject $NewAcl
+}
+
+
