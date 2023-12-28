@@ -24,8 +24,9 @@ function Test-RegistryValue {
 
 if(-not $(Test-RegistryValue -Path $RegKeyPath -Value $value)){
     New-ItemProperty -Path $RegKeyPath -Value $data -Name $value -PropertyType dword -Force
+
+    Restart-Service DNS -Force -Confirm:$false
 }
 Else{
     Set-ItemProperty -Path $RegKeyPath -Value $data -Name $value
 }
-Restart-Service DNS -Force -Confirm:$false
