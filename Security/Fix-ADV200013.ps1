@@ -1,4 +1,10 @@
 # https://msrc.microsoft.com/update-guide/en-US/vulnerability/ADV200013
+# Check if OS is Windows Server
+if($((Get-WMIObject win32_operatingsystem).Caption) -notlike "*Server*"){
+    Write-Output "This is not Windows Server. Script stop."
+    break
+}
+
 $RegKeyPath = "registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\DNS\Parameters"
 $value = 'MaximumUdpPacketSize'
 $data = '1221'
