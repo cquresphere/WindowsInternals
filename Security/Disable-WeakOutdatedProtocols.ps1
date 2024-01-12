@@ -1,5 +1,6 @@
 # Check SSL/TLS configuration on Server:
 # https://www.ssllabs.com/ssltest/
+# https://medium.com/@erdevendra/disable-legacy-tls-protocols-in-windows-systems-6e092eadd33d
 
 #region Functions:
 function Test-RegistryValue {
