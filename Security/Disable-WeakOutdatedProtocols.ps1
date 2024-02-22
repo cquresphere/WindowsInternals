@@ -94,13 +94,16 @@ $WeakCipherSuites = @(
     "RC"
 )
 
+$CipherSuites = @()
 Foreach($WeakCipherSuite in $WeakCipherSuites){
-    $CipherSuites = Get-TlsCipherSuite -Name $WeakCipherSuite
+    $CipherSuites += Get-TlsCipherSuite -Name $WeakCipherSuite    
+}
 
-    if($CipherSuites){
-        Foreach($CipherSuite in $CipherSuites){
-            Disable-TlsCipherSuite -Name $($CipherSuite.Name)
-        }
+if($CipherSuites){
+    Write-Output "Detected weak Cipher Suites: `n$($CipherSuites.Name)"
+
+    Foreach($CipherSuite in $CipherSuites){
+        Disable-TlsCipherSuite -Name $($CipherSuite.Name)
     }
 }
 
