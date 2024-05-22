@@ -64,7 +64,7 @@ Catch {
 
 # Fix Permissions (S-1-5-32-544) Local Administrators Group (Language independent)
 TAKEOWN /F "C:\Program Files\WindowsApps" /R /A /D Y
-ICACLS "C:\Program Files\WindowsApps" /grant S-1-5-32-544:F /T
+ICACLS "C:\Program Files\WindowsApps" /grant "*S-1-5-32-544:(F)" /T
 
 # Add Environment Path
 $ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe"
