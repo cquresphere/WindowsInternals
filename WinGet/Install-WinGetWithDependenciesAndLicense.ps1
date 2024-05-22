@@ -79,8 +79,3 @@ $SystemEnvPath += ";$WingetPath;"
 Get-ChildItem -Path "C:\WinGet" -Recurse | Where-Object { -not ($_.psiscontainer) } | Remove-Item -Force
 Get-ChildItem -Path "C:\WinGet" -Recurse  | Remove-Item -Force
 Get-Item -Path "C:\WinGet" | Remove-Item -Force 
-
-# Cleanup
-Get-ChildItem -Path "C:\WinGet" -Recurse | Where-Object { -not ($_.psiscontainer) } | Remove-Item -Force
-Get-ChildItem -Path "C:\WinGet" -Recurse  | Remove-Item -Force
-Get-Item -Path "C:\WinGet" | Remove-Item -Force 
