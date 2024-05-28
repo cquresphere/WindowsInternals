@@ -1,4 +1,5 @@
 # https://www.stigviewer.com/stig/microsoft_windows_server_20122012_r2_member_server/2023-02-27/finding/V-225493
+# https://www.blumira.com/integration/how-to-disable-null-session-in-windows/
 $RegPathLSA = "registry::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Lsa"
 
 function Test-RegistryValue 
