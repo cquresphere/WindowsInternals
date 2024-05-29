@@ -26,11 +26,19 @@ function Test-RegistryValue
 if(-not $(Test-RegistryValue -key  $RegPathLSA -value RestrictAnonymous)){
     New-ItemProperty -Path $RegPathLSA -Name RestrictAnonymous -PropertyType Dword -Value 1    
 }
+Else{
+    Set-ItemProperty -Path $RegPathLSA -Name RestrictAnonymous -Value 1    
+}
 
 if(-not $(Test-RegistryValue -key  $RegPathLSA -value RestrictAnonymousSAM)){
     New-ItemProperty -Path $RegPathLSA -Name RestrictAnonymousSAM -PropertyType Dword -Value 1    
 }
-
+Else{
+    Set-ItemProperty -Path $RegPathLSA -Name RestrictAnonymousSAM -Value 1    
+}
 if(-not $(Test-RegistryValue -key  $RegPathLSA -value EveryoneIncludesAnonymous)){
     New-ItemProperty -Path $RegPathLSA -Name EveryoneIncludesAnonymous -PropertyType Dword -Value 0    
+}
+Else{
+    Set-ItemProperty -Path $RegPathLSA -Name EveryoneIncludesAnonymous -Value 0    
 }
