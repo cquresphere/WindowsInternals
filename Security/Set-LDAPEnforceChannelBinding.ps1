@@ -34,3 +34,6 @@ function Test-RegistryValue
 if(-not $(Test-RegistryValue -key  $RegPath -value $RegKey)){
     New-ItemProperty -Path $RegPath -Name $RegKey -PropertyType Dword -Value $LDAPEnfChaBinValue    
 }
+Else{
+    Set-ItemProperty -Path $RegPath -Name $RegKey -Value $LDAPEnfChaBinValue    
+}
