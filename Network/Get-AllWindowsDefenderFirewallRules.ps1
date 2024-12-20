@@ -103,3 +103,9 @@ $Duration.Gettype()
 # Notify the user
 Write-Host "Firewall rules exported to $OuputPathForExcelReport"
 Write-Host "Report contains $($AllFirewallRulesRS.Count) Firewall Rules from all Stores $(($AllFirewallRulesRS | Select Name -Unique ).Count) of them are unique."
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore ActiveStore).Count)`t Firewall Rules in ActiveStore"
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore ConfigurableServiceStore).Count)`t Firewall Rules in ConfigurableServiceStore"
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore PersistentStore).Count)`t Firewall Rules in PersistentStore"
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore RSOP).Count)`t Firewall Rules in RSOP"
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore StaticServiceStore).Count)`t Firewall Rules in StaticServiceStore"
+Write-Host "There are: $((Get-NetFirewallRule -PolicyStore SystemDefaults).Count)`t Firewall Rules in SystemDefaults"
