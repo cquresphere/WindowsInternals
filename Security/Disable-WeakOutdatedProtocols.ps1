@@ -23,65 +23,53 @@ Function Set-SSLTLSConfiguration {
         [parameter(Mandatory=$true)] [ValidateNotNullOrEmpty()] [ValidateSet("Enabled","Disabled")]$Status
     )
 
-    if($Status -eq 'Enabled'){
-        $ValuePairs = @{
-            'Enabled' = 1
-            'DisabledByDefault' = 0
-        }
-    }
-    Else{
-        $ValuePairs = @{
-            'Enabled' = 0
-            'DisabledByDefault' = 1
-        }
+    Write-Host "`n🔐 Configuring $Protocol as $Status..."
+
+    $ValuePairs = if ($Status -eq 'Enabled') {
+        @{ 'Enabled' = 1; 'DisabledByDefault' = 0 }
+    } else {
+        @{ 'Enabled' = 0; 'DisabledByDefault' = 1 }
     }
 
-    if($Protocol -eq "SSL2"){
-        $ProtocolRegKey = 'SSL 2.0'
-    }
-    Elseif($Protocol -eq "SSL3"){
-        $ProtocolRegKey = 'SSL 3.0'
-    }
-    Elseif($Protocol -eq "TLS10"){
-        $ProtocolRegKey = 'TLS 1.0'
-    }
-    Elseif($Protocol -eq "TLS11"){
-        $ProtocolRegKey = 'TLS 1.1'
-    }
-    Elseif($Protocol -eq "TLS12"){
-        $ProtocolRegKey = 'TLS 1.2'
-    }
-    Elseif($Protocol -eq "TLS13"){
-        $ProtocolRegKey = 'TLS 1.3'
+    $ProtocolRegKey = switch ($Protocol) {
+        "SSL2"  { 'SSL 2.0' }
+        "SSL3"  { 'SSL 3.0' }
+        "TLS10" { 'TLS 1.0' }
+        "TLS11" { 'TLS 1.1' }
+        "TLS12" { 'TLS 1.2' }
+        "TLS13" { 'TLS 1.3' }
     }
 
     $ProtocolsRegPath = 'SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
     $RegPath = "registry::HKEY_LOCAL_MACHINE\$ProtocolsRegPath"
 
-    if(-not $(Test-Path -Path "$RegPath\$ProtocolRegKey")){
+    if (-not (Test-Path "$RegPath\$ProtocolRegKey")) {
+        Write-Host "➕ Creating protocol key: $ProtocolRegKey"
         $key = (Get-Item HKLM:\).OpenSubKey("$ProtocolsRegPath", $true)
         $key.CreateSubKey($ProtocolRegKey)
         $key.Close()
     }
 
-    $KeysToCreate = @(
-        'Client','Server' 
-    )
+    foreach ($Key in @('Client','Server')) {
+        $fullKeyPath = "$RegPath\$ProtocolRegKey\$Key"
 
-    Foreach($Key in $KeysToCreate){
-        # Keys
-        if(-not $(Test-Path -Path "$RegPath\$ProtocolRegKey\$Key")){
+        if (-not (Test-Path $fullKeyPath)) {
+            Write-Host "➕ Creating subkey: $fullKeyPath"
             New-Item -Path "$RegPath\$ProtocolRegKey" -Name $Key -Force | Out-Null
-        } 
+        }
 
-        # Values
-        Foreach($Value in $ValuePairs.GetEnumerator()){
-            if(-not $(Test-RegistryValue "$RegPath\$ProtocolRegKey\$Key" -Value $($Value.Name))){
-                New-ItemProperty -Path "$RegPath\$ProtocolRegKey\$Key" -Name $($Value.Name) -Value $($Value.Value)  -PropertyType 'DWord' -Force
+        foreach ($Value in $ValuePairs.GetEnumerator()) {
+            $currentValue = Get-ItemProperty -Path $fullKeyPath -Name $Value.Key -ErrorAction SilentlyContinue
+            if ($null -eq $currentValue) {
+                Write-Host "⚠️ Value '$($Value.Key)' not found in $fullKeyPath. Creating with value: $($Value.Value)"
+                New-ItemProperty -Path $fullKeyPath -Name $Value.Key -Value $Value.Value -PropertyType 'DWord' -Force | Out-Null
+            } elseif ($currentValue.$($Value.Key) -ne $Value.Value) {
+                Write-Host "🔄 Updating '$($Value.Key)' in $fullKeyPath from $($currentValue.$($Value.Key)) to $($Value.Value)"
+                Set-ItemProperty -Path $fullKeyPath -Name $Value.Key -Value $Value.Value -Force | Out-Null
+            } else {
+                Write-Verbose "✔ '$($Value.Key)' in $fullKeyPath is already set to $($Value.Value)"
+                Write-Host "✔ '$($Value.Key)' in $fullKeyPath is correct ($($Value.Value))"
             }
-            Else{
-                Set-ItemProperty -Path "$RegPath\$ProtocolRegKey\$Key" -Name $($Value.Name) -Value $($Value.Value) -Force | Out-Null
-            }            
         }
     }
 }
@@ -125,17 +113,22 @@ $RegKeysDisable = @(
 )
 
 Foreach($RegKey in $RegKeysDisable){
-    if(-not $(Test-Path -Path "$RegPath\$RegKey")){
+    $keyPath = "$RegPath\$RegKey"
+    if (-not (Test-Path $keyPath)) {
+        Write-Host "➕ Creating cipher key: $RegKey"
         $key = (Get-Item HKLM:\).OpenSubKey("SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers", $true)
         $key.CreateSubKey($RegKey)
         $key.Close()
-        New-ItemProperty -Path "$RegPath\$RegKey" -Name 'Enabled' -PropertyType Dword -Value 0 -Force | Out-Null
+        New-ItemProperty -Path $keyPath -Name 'Enabled' -PropertyType Dword -Value 0 -Force | Out-Null
     }
 
-    if($(Get-ItemPropertyValue -Path "$RegPath\$RegKey" -Name 'Enabled') -ne 0){
-        Set-ItemProperty -Path "$RegPath\$RegKey" -Name 'Enabled' -Value 0 -Force | Out-Null
+    $current = Get-ItemPropertyValue -Path $keyPath -Name 'Enabled'
+    if ($current -ne 0) {
+        Write-Host "🔄 Disabling cipher '$RegKey' (was $current)"
+        Set-ItemProperty -Path $keyPath -Name 'Enabled' -Value 0 -Force | Out-Null
+    } else {
+        Write-Host "✔ Cipher '$RegKey' already disabled"
     }
-
 }
 
 # Ciphers to enable
