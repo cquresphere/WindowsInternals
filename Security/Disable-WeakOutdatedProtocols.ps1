@@ -177,7 +177,7 @@ Else{
 Set-SSLTLSConfiguration -Protocol SSL2 -Status Disabled
 Set-SSLTLSConfiguration -Protocol SSL3 -Status Disabled
 Set-SSLTLSConfiguration -Protocol TLS10 -Status Disabled
-Set-SSLTLSConfiguration -Protocol TLS11 -Status Enabled
+Set-SSLTLSConfiguration -Protocol TLS11 -Status Disabled
 Set-SSLTLSConfiguration -Protocol TLS12 -Status Enabled
 if($((Get-WmiObject Win32_OperatingSystem).caption) -like "*2022*"){
     Set-SSLTLSConfiguration -Protocol TLS13 -Status Enabled
