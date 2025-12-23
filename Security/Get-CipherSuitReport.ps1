@@ -1,3 +1,5 @@
+Import-Module ImportExcel -ErrorAction Stop
+
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $path = "C:\Temp\TLSCipherReport_$timestamp.xlsx"
 $wsName = 'TLSCipherSuites'
@@ -38,7 +40,5 @@ ForEach($i in $(Get-TlsCipherSuite)) {
     $report += $obj
 }
 
-# Export everything (most reliable). You can later narrow columns if you want.
 $report | Export-Excel -Path $path -AutoSize -FreezeTopRow -BoldTopRow -TableName "TLSCipherSuites" -WorksheetName $wsName -TableStyle Medium6
-
 Write-Host "Report created:`n$path" -ForegroundColor Cyan
