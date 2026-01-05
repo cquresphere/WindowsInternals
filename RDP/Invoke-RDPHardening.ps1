@@ -83,7 +83,7 @@
         - Domain Controller remediation requires -Force parameter.
 
 .LINK
-    https://docs.microsoft.com/en-us/windows/security/threat-protection/security-policy-settings/
+    https://techcommunity.microsoft.com/blog/askds/more-speaking-in-ciphers-and-other-enigmatic-tongues-with-a-focus-on-schannel-ha/4047491
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact="High")]
