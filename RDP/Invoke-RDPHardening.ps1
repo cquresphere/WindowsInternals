@@ -82,8 +82,10 @@
         - Always validate changes in a staging OU/lab first.
         - Domain Controller remediation requires -Force parameter.
 
-.LINK
+.LINKS
     https://techcommunity.microsoft.com/blog/askds/more-speaking-in-ciphers-and-other-enigmatic-tongues-with-a-focus-on-schannel-ha/4047491
+
+    https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings?tabs=diffie-hellman
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact="High")]
