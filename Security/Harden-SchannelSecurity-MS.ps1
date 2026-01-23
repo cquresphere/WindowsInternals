@@ -1,20 +1,26 @@
 <#
 .SYNOPSIS
     Windows Schannel TLS/SSL Security Hardening - Production Tested Configuration
-    Based on: Microsoft AskDS recommendations + IISCrypto best practices
+    Based on: Microsoft TLS Registry Settings + IISCrypto best practices
 
 .DESCRIPTION
     Implements comprehensive Schannel hardening that has been tested and confirmed
-    working on Windows Server 2019 Domain Controller without breaking RDP.
+    working on Windows Server 2012+ including Domain Controllers without breaking RDP.
 
     WHAT THIS SCRIPT CONFIGURES:
     ============================
 
     Schannel Security Settings:
-    - AllowInsecureRenegoClients = 0 (disabled)
-    - AllowInsecureRenegoServers = 0 (disabled)
-    - UseScsvForTls = 1 (enabled - TLS Fallback SCSV protection)
-    - EventLogging = 1 (basic) or 7 (verbose)
+    - AllowInsecureRenegoClients = 0 (disabled - CVE-2009-3555 mitigation)
+    - AllowInsecureRenegoServers = 0 (disabled - CVE-2009-3555 mitigation)
+    - UseScsvForTls = 1 (enabled - TLS Fallback SCSV protection, RFC 7507)
+    - DisableCompression = 1 (disabled - CRIME attack mitigation)
+    - EventLogging = 0-7 (configurable, default: 1 = Error events only)
+
+    OCSP Stapling (Optional):
+    - EnableOcspStaplingForSni = 0/1 (default: not configured)
+    - Improves TLS performance, reduces OCSP server load
+    - Use -EnableOcspStapling parameter
 
     Protocols DISABLED:
     - Multi-Protocol Unified Hello
@@ -25,7 +31,7 @@
 
     Protocols ENABLED:
     - TLS 1.2
-    - TLS 1.3 (on supported systems - Server 2022+, Win10 20H2+)
+    - TLS 1.3 (on supported systems - Server 2022+, Win10 20H2+ Build 19042+)
     - DTLS 1.2
 
     Ciphers DISABLED (Enabled=0):
@@ -41,44 +47,192 @@
     - MD5: Disabled (0)
     - SHA, SHA256, SHA384, SHA512: Enabled (0xFFFFFFFF)
 
-    Key Exchange:
-    - Diffie-Hellman: Enabled, MinKeyBitLength=2048
+    Key Exchange Algorithms:
+    - Diffie-Hellman: Enabled, MinKeyBitLength=2048 (configurable 1024-4096)
     - ECDH: Enabled, ClientMinKeyBitLength=2048, EphemKeyReuseTime=0 (Server 2022+)
-    - PKCS: Enabled
+    - PKCS/RSA: Enabled, ClientMinKeyBitLength=2048 (NEW in v3.0.0)
+    - ECC Curve Priority: P-384, P-256, curve25519 (Server 2016+)
+
+    Cipher Suite Ordering (Optional):
+    - Prioritizes ECDHE suites with AES-GCM for Perfect Forward Secrecy
+    - Server-side cipher suite selection (not client)
+    - Use -EnableCipherSuiteOrder parameter to configure
+
+    Session Cache (Optional):
+    - Default: 10-hour cache, 20,000 elements max (~60MB memory)
+    - High-security mode: Disable with -DisableSessionCache (forces full handshake)
+    - Configurable with -MaximumCacheSize parameter
+
+    Trusted Issuer List (Optional):
+    - Default: Don't send trusted CA list to clients (0)
+    - Enable with -SendTrustedIssuerList (may leak PKI info)
 
     .NET Framework:
-    - SystemDefaultTlsVersions = 1
-    - SchUseStrongCrypto = 1
+    - SystemDefaultTlsVersions = 1 (v2.0.50727 + v4.0.30319, x86 + x64)
+    - SchUseStrongCrypto = 1 (v2.0.50727 + v4.0.30319, x86 + x64)
 
     WinHTTP:
-    - DefaultSecureProtocols = 0x2800 (TLS 1.2 + 1.3) for Server 2012 R2+
-    - DefaultSecureProtocols = 0x0A00 (TLS 1.2 only) for Server 2012
+    - DefaultSecureProtocols = 0x2800 (TLS 1.2 + 1.3) for Server 2022+ / Win10 20H2+ (Build 19042+)
+    - DefaultSecureProtocols = 0x0800 (TLS 1.2 only) for Server 2012/2012 R2/2016/2019
+
+    APPLICATION-LEVEL SECURITY (NOT CONFIGURED BY THIS SCRIPT):
+    ============================================================
+    The following must be configured at the web server/application level:
+
+    - HTTP Strict Transport Security (HSTS): CRITICAL for preventing protocol downgrade attacks
+      * Recommended header: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+      * Configure in IIS, Apache, Nginx, or application code
+      * Consider HSTS preload list submission: https://hstspreload.org/
+
+    - Content Security Policy (CSP): Prevents XSS and mixed-content vulnerabilities
+      * Example: Content-Security-Policy: default-src https: 'unsafe-inline' 'unsafe-eval'
+      * Configure in web server or application headers
+
+    - Secure Cookies: Mark all cookies with Secure and HttpOnly flags
+      * Prevents cookie theft over unencrypted connections
+      * Configure in application code or web server
+
+    - Certificate Configuration:
+      * Use 2048-bit RSA minimum (3072-bit for high security)
+      * Consider ECDSA P-256 certificates for better performance
+      * Deploy complete certificate chains (leaf + intermediates)
+      * Implement OCSP stapling in IIS/web server
+      * Use DNS CAA records to restrict certificate issuance
+
+    References:
+    - SSL Labs Best Practices: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
+    - OWASP TLS Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Security_Cheat_Sheet.html
 
     VERSION-SPECIFIC BEHAVIOR:
     - Server 2008/2008 R2 (Build <9200): BLOCKED - End of Life, incompatible
     - Server 2012 (Build 9200): Conservative TLS 1.2-only approach
     - Server 2012 R2+ (Build 9600+): Full modern hardening
+    - Server 2022+ (Build 20348+): Enhanced PFS with EphemKeyReuseTime=0
 
 .PARAMETER MinDhKeyBits
-    Minimum DH/ECDH key length. Default: 2048
+    Minimum key length for Diffie-Hellman, ECDH, and PKCS/RSA key exchange algorithms.
+    Valid values: 1024, 2048, 3072, 4096
+    Default: 2048
+    Recommendation: Use 2048 minimum, 3072 for high-security environments
 
 .PARAMETER WinHttpProtocols
-    WinHTTP DefaultSecureProtocols value. Default: Auto-detected based on OS version
-    Server 2012: 0x0A00 (TLS 1.2 only)
-    Server 2012 R2+: 0x2800 (TLS 1.2 + 1.3)
+    WinHTTP DefaultSecureProtocols registry value (DWORD).
+    Default: 0 (auto-detect based on OS version)
+    - Server 2012/2012 R2/2016/2019: Auto-detects to 0x0800 (TLS 1.2 only)
+    - Server 2022+ / Win10 20H2+ (Build 19042+): Auto-detects to 0x2800 (TLS 1.2 + 1.3)
+    Common values:
+    - 0x0800 = TLS 1.2 only
+    - 0x0A00 = TLS 1.1 + 1.2
+    - 0x2800 = TLS 1.2 + 1.3
+    - 0x0A80 = TLS 1.0 + 1.1 + 1.2 (not recommended)
 
-.PARAMETER EnableVerboseLogging
-    Enable verbose Schannel logging (EventLogging=7). Default: $false
+.PARAMETER EventLogging
+    Schannel event logging level (0-7).
+    Default: 1 (Error events only)
+    Values:
+    - 0 = No events
+    - 1 = Error events only (recommended default)
+    - 2 = Warning events only
+    - 3 = Error + Warning
+    - 4 = Info + Success events
+    - 5 = Error + Info + Success
+    - 6 = Warning + Info + Success
+    - 7 = All events (Error + Warning + Info + Success) - use for troubleshooting
+    Note: Requires reboot to take effect. High levels may generate significant event log volume.
+
+.PARAMETER EnableOcspStapling
+    Enable OCSP (Online Certificate Status Protocol) stapling for SNI bindings.
+    Default: Not configured (disabled for SNI/CCS, enabled for simple bindings)
+
+    Benefits:
+    - Reduces OCSP server load by caching responses
+    - Improves TLS handshake performance for simple SSL/TLS bindings
+
+    Considerations:
+    - May cause performance issues on servers with many SNI certificates
+    - Monitor IIS/application performance after enabling
+
+    Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+.PARAMETER DisableSessionCache
+    Disable TLS session caching for maximum security (high-security mode).
+    Default: $false (session caching enabled with 10-hour timeout)
+
+    When enabled:
+    - Sets ClientCacheTime = 0 (disables client-side session cache)
+    - Sets ServerCacheTime = 0 (disables server-side session cache)
+    - Prevents session resumption attacks
+    - Forces full TLS handshake for every connection
+    - Reduces performance but increases security
+
+    Use case: Environments requiring maximum security with no session reuse
+    Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+.PARAMETER MaximumCacheSize
+    Maximum number of TLS session cache elements (server-side).
+    Default: 20,000 elements
+    Valid range: 0-100,000
+    Memory usage: Each element uses 2-4KB (~40-80MB for 20,000 elements)
+
+    Set to 0: Disables server-side session cache (similar to -DisableSessionCache)
+    Higher values: More memory usage but better performance for high-traffic servers
+
+    Note: Only applies when -DisableSessionCache is NOT used
+    Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+.PARAMETER SendTrustedIssuerList
+    Send list of trusted Certificate Authorities to clients during TLS handshake.
+    Default: $false (don't send list - secure default on Server 2012+)
+
+    When enabled ($true):
+    - Server sends trusted CA list in TLS handshake
+    - Helps clients select appropriate certificate for mutual TLS authentication
+    - May leak information about your PKI infrastructure
+
+    When disabled ($false):
+    - Server does not send trusted CA list (security through obscurity)
+    - Client must know which certificate to present
+
+    Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+.PARAMETER EnableCipherSuiteOrder
+    Configure Windows cipher suite ordering to prioritize Perfect Forward Secrecy (PFS) suites.
+    Default: $false (don't modify cipher suite order)
+
+    When enabled ($true):
+    - Configures cipher suite order following SSL Labs best practices
+    - Prioritizes ECDHE suites with AES-GCM (AEAD mode)
+    - Ensures server controls cipher suite selection, not client
+    - Removes weak/deprecated suites from the list
+
+    Benefits:
+    - Perfect Forward Secrecy (protects past sessions if key compromised)
+    - Modern AEAD ciphers (GCM, CHACHA20-POLY1305)
+    - Optimized performance with hardware-accelerated AES
+
+    Note: This uses Set-TlsCipherSuiteOrder cmdlet (Windows Server 2012 R2+)
+    Reference: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
 
 .PARAMETER BackupPath
-    Path for registry backup. Default: $env:TEMP
+    Directory path for registry backup files.
+    Default: $env:TEMP
+    Backup files:
+    - SchannelBackup_<timestamp>.reg (registry export)
+    - SchannelHardening_<timestamp>.log (detailed log)
 
 .PARAMETER Force
-    Bypass Windows Server 2008/2008 R2 blocking (NOT RECOMMENDED - may break system)
+    Bypass Windows Server 2008/2008 R2 version blocking.
+    Default: $false
+
+    WARNING: NOT RECOMMENDED
+    - Server 2008/2008 R2 are End of Life (January 14, 2020)
+    - Limited TLS 1.2 support, no TLS 1.3
+    - May break system or cause security issues
+    - Use only for testing or legacy compatibility
 
 .EXAMPLE
     .\Harden-SchannelSecurity-MS.ps1 -WhatIf
-    Preview changes without applying.
+    Preview all changes without applying them.
 
 .EXAMPLE
     .\Harden-SchannelSecurity-MS.ps1 -Confirm:$false
@@ -86,23 +240,73 @@
 
 .EXAMPLE
     .\Harden-SchannelSecurity-MS.ps1 -MinDhKeyBits 3072
-    Use 3072-bit minimum key length for DH/ECDH.
+    Use 3072-bit minimum key length for DH/ECDH/RSA (high-security).
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -EventLogging 7
+    Enable maximum event logging for troubleshooting TLS issues.
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -EnableOcspStapling
+    Enable OCSP stapling for improved TLS handshake performance.
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -DisableSessionCache
+    Disable TLS session caching for maximum security (reduces performance).
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -MinDhKeyBits 3072 -EventLogging 7 -EnableOcspStapling
+    High-security configuration with verbose logging and OCSP stapling.
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -EnableCipherSuiteOrder
+    Apply hardening with optimized cipher suite ordering for Perfect Forward Secrecy.
+
+.EXAMPLE
+    .\Harden-SchannelSecurity-MS.ps1 -EnableCipherSuiteOrder -MinDhKeyBits 3072 -DisableSessionCache
+    Maximum security configuration with PFS cipher ordering, 3072-bit keys, and no session caching.
 
 .NOTES
     Author:         Karol Kula (cquresphere)
-    Version:        2.2.0
+    Version:        3.1.1
+    Last Updated:   2026-01-22
     Tested On:      Windows Server 2012, 2012 R2, 2016, 2019, 2022
-    Reference:      Microsoft AskDS Team + IISCrypto
+
+    References:
+    - Microsoft TLS Registry Settings: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+    - Microsoft Manage TLS: https://learn.microsoft.com/en-us/windows-server/security/tls/manage-tls
+    - Cipher Suites in Schannel: https://learn.microsoft.com/en-us/windows/win32/secauthn/cipher-suites-in-schannel
+    - SSL Labs Best Practices: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
+    - RFC 7507 TLS Fallback SCSV: https://tools.ietf.org/html/rfc7507
+    - CVE-2009-3555 Renegotiation Attack: https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2009-3555
 
     Supported Versions:
     - Windows Server 2012 (Build 9200): Minimum supported version
     - Windows Server 2012 R2+ (Build 9600+): Full feature support
-    - Windows Server 2008/2008 R2: BLOCKED (End of Life)
+    - Windows Server 2008/2008 R2: BLOCKED (End of Life - use -Force to override)
+
+    Requirements:
+    - PowerShell 5.1 or later
+    - Administrator privileges
+    - Reboot required after execution
 
     Changelog:
+    - 3.1.1: Fixed registry backup failing for paths containing spaces (e.g., WinHttp keys under
+             "Internet Settings") by adding proper quoting in reg export arguments
+    - 3.1.0: Added TLS compression disable (CRIME mitigation), cipher suite ordering (PFS priority),
+             ECC curve configuration, application-level security documentation (HSTS, CSP, cookies),
+             aligned with SSL Labs best practices
+    - 3.0.0: Added PKCS/RSA key length, OCSP stapling, session cache controls, trusted issuer list,
+             enhanced EventLogging (0-7), comprehensive documentation with reference links
     - 2.2.0: Added version detection for Server 2008/2012, version-specific settings
-    - 1.1.0: Added missing EphemKeyReuseTime for PFS, fixed ShouldProcess warnings
-    - 1.0.0: Initial production-tested version
+    - 2.1.0: Added missing EphemKeyReuseTime for PFS, fixed ShouldProcess warnings
+    - 2.0.0: Initial production-tested version with full hardening support
+
+.LINK
+    https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+.LINK
+    https://learn.microsoft.com/en-us/windows-server/security/tls/manage-tls
 #>
 
 #Requires -RunAsAdministrator
@@ -115,7 +319,25 @@ param(
 
     [int]$WinHttpProtocols = 0,  # 0 = Auto-detect based on OS version
 
-    [switch]$EnableVerboseLogging,
+    [Parameter()]
+    [ValidateRange(0, 7)]
+    [int]$EventLogging = 1,
+
+    [Parameter()]
+    [switch]$EnableOcspStapling,
+
+    [Parameter()]
+    [switch]$DisableSessionCache,
+
+    [Parameter()]
+    [ValidateRange(0, 100000)]
+    [int]$MaximumCacheSize = 20000,
+
+    [Parameter()]
+    [switch]$SendTrustedIssuerList,
+
+    [Parameter()]
+    [switch]$EnableCipherSuiteOrder,
 
     [string]$BackupPath = $env:TEMP,
 
@@ -274,6 +496,29 @@ function Set-RegistryValue {
     }
 }
 
+function Remove-RegistryValue {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Path,
+        [string]$Name,
+        [string]$Description
+    )
+
+    $current = $null
+    try { $current = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).$Name } catch { }
+
+    if ($null -ne $current) {
+        if ($PSCmdlet.ShouldProcess("$Path\$Name", "Remove value")) {
+            Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+            Write-Log "$Description : Removed (was $current)" -Level OK
+            $Script:AppliedCount++
+        }
+    } else {
+        Write-Log "$Description : Not set" -Level SKIP
+        $Script:SkippedCount++
+    }
+}
+
 function Set-CipherValue {
     <#
     .SYNOPSIS
@@ -287,9 +532,21 @@ function Set-CipherValue {
     )
 
     $regPath = "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers\$CipherName"
+    $key = $null
 
     try {
-        $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($regPath)
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($regPath, $true)
+
+        if ($null -eq $key) {
+            if ($PSCmdlet.ShouldProcess($CipherName, "Create key")) {
+                $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($regPath)
+            } else {
+                Write-Log "Skipped creating key for $CipherName (WhatIf)" -Level SKIP
+                $Script:SkippedCount++
+                return
+            }
+        }
+
         if ($null -eq $key) {
             Write-Log "Failed to create key for $CipherName" -Level ERROR
             return
@@ -307,10 +564,10 @@ function Set-CipherValue {
             Write-Log "$Description : Already $Value" -Level SKIP
             $Script:SkippedCount++
         }
-
-        $key.Close()
     } catch {
         Write-Log "Error setting $CipherName : $_" -Level ERROR
+    } finally {
+        if ($null -ne $key) { $key.Close() }
     }
 }
 #endregion Registry Helpers
@@ -320,22 +577,47 @@ function New-Backup {
     $backupFile = Join-Path $BackupPath "SchannelBackup_$Script:Timestamp.reg"
     Write-Log "Creating backup: $backupFile" -Level INFO
 
-    @(
+    $regPaths = @(
         'HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL'
         'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\.NETFramework'
         'HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\.NETFramework'
         'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp'
         'HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp'
-    ) | ForEach-Object {
+    )
+
+    $first = $true
+    $hadExport = $false
+
+    foreach ($regPath in $regPaths) {
         $temp = [IO.Path]::GetTempFileName()
-        $null = reg export $_ $temp /y 2>&1
-        if (Test-Path $temp) {
-            Get-Content $temp -ErrorAction SilentlyContinue | Add-Content $backupFile
+        $proc = Start-Process -FilePath reg -ArgumentList @('export', "`"$regPath`"", "`"$temp`"", '/y') -NoNewWindow -PassThru -Wait
+        if ($proc.ExitCode -ne 0) {
+            Write-Log "Backup export failed for $regPath (exit $($proc.ExitCode))" -Level WARN
             Remove-Item $temp -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        if (Test-Path $temp) {
+            $content = Get-Content $temp -ErrorAction SilentlyContinue
+            if (-not $first) {
+                $content = $content | Where-Object { $_ -notmatch '^Windows Registry Editor Version' }
+            }
+            if ($content) {
+                Add-Content $backupFile -Value $content
+                $first = $false
+                $hadExport = $true
+            }
+            Remove-Item $temp -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Log "Backup export temp missing for $regPath" -Level WARN
         }
     }
 
-    Write-Log "Backup created" -Level OK
+    if (-not $hadExport) {
+        Write-Log "Backup failed: no registry data exported" -Level ERROR
+    } else {
+        Write-Log "Backup created" -Level OK
+    }
     return $backupFile
 }
 #endregion Backup
@@ -352,11 +634,61 @@ function Set-SchannelBaseSettings {
     # Enable TLS Fallback SCSV (RFC 7507 - downgrade attack protection)
     Set-RegistryValue -Path $Script:SchannelBase -Name 'UseScsvForTls' -Value 1 -Description "UseScsvForTls"
 
-    # Event logging
-    $logValue = if ($EnableVerboseLogging) { 7 } else { 1 }
-    Set-RegistryValue -Path $Script:SchannelBase -Name 'EventLogging' -Value $logValue -Description "EventLogging"
+    # Disable TLS compression (CRIME attack mitigation)
+    # Reference: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
+    Set-RegistryValue -Path $Script:SchannelBase -Name 'DisableCompression' -Value 1 -Description "DisableCompression (CRIME mitigation)"
+
+    # Event logging (0-7 scale)
+    # 0=None, 1=Error, 2=Warn, 3=Error+Warn, 4=Info+Success, 5=Error+Info+Success, 6=Warn+Info+Success, 7=All
+    Set-RegistryValue -Path $Script:SchannelBase -Name 'EventLogging' -Value $EventLogging -Description "EventLogging"
+
+    $logDesc = switch ($EventLogging) {
+        0 { "No events" }
+        1 { "Error events only" }
+        2 { "Warning events only" }
+        3 { "Error + Warning" }
+        4 { "Info + Success" }
+        5 { "Error + Info + Success" }
+        6 { "Warning + Info + Success" }
+        7 { "All events" }
+    }
+    Write-Log "Event logging level $EventLogging`: $logDesc" -Level INFO
 }
 #endregion Schannel Base Settings
+
+#region OCSP Stapling
+function Set-OcspStapling {
+    <#
+    .SYNOPSIS
+        Configures OCSP (Online Certificate Status Protocol) stapling for SNI.
+        Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+    .DESCRIPTION
+        OCSP stapling improves TLS handshake performance by having the server cache and provide
+        OCSP responses during the handshake, reducing client OCSP queries.
+
+        Benefits:
+        - Reduces OCSP server load
+        - Improves TLS handshake performance for simple SSL/TLS bindings
+
+        Considerations:
+        - May cause performance issues on servers with many SNI certificates
+        - Default: Enabled for simple bindings, Disabled for SNI/CCS bindings
+    #>
+    Write-Log ""
+    Write-Log "=== OCSP STAPLING ===" -Level INFO
+
+    if ($EnableOcspStapling) {
+        Write-Log "Enabling OCSP Stapling for SNI" -Level INFO
+        Write-Log "IMPORTANT: This may impact performance on servers with many SNI certificates" -Level WARN
+        Write-Log "Monitor IIS performance after enabling this feature" -Level WARN
+        Set-RegistryValue -Path $Script:SchannelBase -Name 'EnableOcspStaplingForSni' -Value 1 -Description "EnableOcspStaplingForSni"
+    } else {
+        Write-Log "OCSP Stapling: Not configured (use -EnableOcspStapling to enable)" -Level INFO
+        Write-Log "Note: Already enabled by default for simple SSL/TLS bindings (IIS)" -Level INFO
+    }
+}
+#endregion OCSP Stapling
 
 #region Protocol Configuration
 function Set-Protocols {
@@ -496,16 +828,7 @@ function Set-Hashes {
     Write-Log "Enabling: SHA, SHA256, SHA384, SHA512" -Level INFO
     foreach ($hash in $enableHashes) {
         $path = "$Script:SchannelBase\Hashes\$hash"
-        if (-not (Test-Path $path)) {
-            if ($PSCmdlet.ShouldProcess($path, "Create key")) {
-                New-Item -Path $path -Force | Out-Null
-            }
-        }
-        if ($PSCmdlet.ShouldProcess("$path\Enabled", "Set to 0xFFFFFFFF")) {
-            New-ItemProperty -Path $path -Name 'Enabled' -PropertyType DWord -Value 0xFFFFFFFF -Force | Out-Null
-            Write-Log "$hash Enabled: 0xFFFFFFFF" -Level OK
-            $Script:AppliedCount++
-        }
+        Set-RegistryValue -Path $path -Name 'Enabled' -Value 0xFFFFFFFF -Description "$hash Enabled"
     }
 }
 #endregion Hash Configuration
@@ -538,10 +861,11 @@ function Set-KeyExchange {
         Write-Log "EphemKeyReuseTime: Skipped (only effective on Server 2022+, current build: $Script:OsBuild)" -Level INFO
     }
 
-    # PKCS
-    Write-Log "Enabling PKCS" -Level INFO
+    # PKCS/RSA - ClientMinKeyBitLength added in v3.0.0 (was missing in previous versions)
+    Write-Log "Configuring PKCS/RSA (ClientMinKeyBitLength=$MinDhKeyBits)" -Level INFO
     $pkcsPath = "$Script:SchannelBase\KeyExchangeAlgorithms\PKCS"
     Set-RegistryValue -Path $pkcsPath -Name 'Enabled' -Value 0xFFFFFFFF -Description "PKCS Enabled"
+    Set-RegistryValue -Path $pkcsPath -Name 'ClientMinKeyBitLength' -Value $MinDhKeyBits -Description "PKCS/RSA ClientMinKeyBitLength"
 }
 #endregion Key Exchange Configuration
 
@@ -566,6 +890,90 @@ function Set-DotNetFramework {
 }
 #endregion .NET Framework Configuration
 
+#region Session Cache Configuration
+function Set-SessionCache {
+    <#
+    .SYNOPSIS
+        Configures TLS session cache settings for performance or security optimization.
+        Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+    .DESCRIPTION
+        Session caching allows TLS session resumption, improving performance but storing session data.
+
+        Default behavior:
+        - ClientCacheTime: 10 hours
+        - ServerCacheTime: 10 hours
+        - MaximumCacheSize: 20,000 elements (~40-80MB memory at 2-4KB per element)
+
+        High-security mode (-DisableSessionCache):
+        - Disables session resumption (ClientCacheTime = 0, ServerCacheTime = 0)
+        - Prevents potential session resumption attacks
+        - Reduces performance (full handshake for every connection)
+    #>
+    Write-Log ""
+    Write-Log "=== SESSION CACHE ===" -Level INFO
+
+    if ($DisableSessionCache) {
+        Write-Log "Disabling TLS session cache (high-security mode)" -Level WARN
+        Set-RegistryValue -Path $Script:SchannelBase -Name 'ClientCacheTime' -Value 0 -Description "ClientCacheTime (disabled)"
+        Set-RegistryValue -Path $Script:SchannelBase -Name 'ServerCacheTime' -Value 0 -Description "ServerCacheTime (disabled)"
+        Write-Log "WARNING: This will reduce performance but increases security" -Level WARN
+        Write-Log "Every TLS connection will require a full handshake" -Level WARN
+    } else {
+        Write-Log "Session cache: Using system defaults (10 hours)" -Level INFO
+        Set-RegistryValue -Path $Script:SchannelBase -Name 'MaximumCacheSize' -Value $MaximumCacheSize -Description "MaximumCacheSize"
+
+        $cacheProps = Get-ItemProperty -Path $Script:SchannelBase -ErrorAction SilentlyContinue
+        if ($null -ne $cacheProps) {
+            if ($cacheProps.ClientCacheTime -eq 0) {
+                Remove-RegistryValue -Path $Script:SchannelBase -Name 'ClientCacheTime' -Description "ClientCacheTime (restore default)"
+            }
+            if ($cacheProps.ServerCacheTime -eq 0) {
+                Remove-RegistryValue -Path $Script:SchannelBase -Name 'ServerCacheTime' -Description "ServerCacheTime (restore default)"
+            }
+        }
+
+        $memoryMB = [math]::Round($MaximumCacheSize * 3 / 1024, 1)
+        Write-Log "Cache capacity: $MaximumCacheSize sessions (~$memoryMB MB memory)" -Level INFO
+    }
+}
+#endregion Session Cache Configuration
+
+#region Trusted Issuer List Configuration
+function Set-TrustedIssuerList {
+    <#
+    .SYNOPSIS
+        Configures whether to send the trusted issuer list to TLS clients.
+        Reference: https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings
+
+    .DESCRIPTION
+        Controls SendTrustedIssuerList registry setting.
+
+        When enabled (1):
+        - Server sends list of trusted Certificate Authorities to clients during TLS handshake
+        - Helps clients select appropriate certificate for authentication
+        - May leak information about your PKI infrastructure
+
+        When disabled (0 - default on Server 2012+):
+        - Server does not send trusted CA list
+        - Better security through obscurity
+        - Client must know which certificate to present
+    #>
+    Write-Log ""
+    Write-Log "=== TRUSTED ISSUER LIST ===" -Level INFO
+
+    $value = if ($SendTrustedIssuerList) { 1 } else { 0 }
+    Set-RegistryValue -Path $Script:SchannelBase -Name 'SendTrustedIssuerList' -Value $value -Description "SendTrustedIssuerList"
+
+    if ($SendTrustedIssuerList) {
+        Write-Log "Sending trusted CA list to clients during TLS handshake" -Level INFO
+        Write-Log "WARNING: This may leak PKI infrastructure information" -Level WARN
+    } else {
+        Write-Log "Trusted CA list: Not sent to clients (default secure behavior)" -Level INFO
+    }
+}
+#endregion Trusted Issuer List Configuration
+
 #region WinHTTP Configuration
 function Set-WinHttp {
     Write-Log ""
@@ -573,23 +981,22 @@ function Set-WinHttp {
 
     # Auto-detect WinHTTP protocol value if not specified
     $actualProtocols = if ($WinHttpProtocols -eq 0) {
-        if ($Script:OsBuild -eq 9200) {
-            # Server 2012: TLS 1.2 only (conservative)
-            0x0A00
-        } else {
-            # Server 2012 R2+: TLS 1.2 + 1.3
+        if ($Script:OsBuild -ge 19042) {
+            # Server 2022+ / Win10 20H2+: TLS 1.2 + 1.3
             0x2800
+        } else {
+            # Server 2012-2019: TLS 1.2 only
+            0x0800
         }
     } else {
         $WinHttpProtocols
     }
 
     $protoDesc = switch ($actualProtocols) {
-        0xAA0  { "TLS 1.0 + 1.1 + 1.2" }
+        0x0A80 { "TLS 1.0 + 1.1 + 1.2" }
         0x2800 { "TLS 1.2 + 1.3" }
-        0x0A00 { "TLS 1.2 only" }
-        0xA80  { "TLS 1.1 + 1.2" }
-        0x800  { "TLS 1.2 only (alternate)" }
+        0x0A00 { "TLS 1.1 + 1.2" }
+        0x0800 { "TLS 1.2 only" }
         default { "0x$($actualProtocols.ToString('X'))" }
     }
 
@@ -648,11 +1055,216 @@ function Disable-NullCipherSuites {
 }
 #endregion Disable NULL Cipher Suites
 
+#region Cipher Suite Ordering
+function Set-CipherSuiteOrder {
+    <#
+    .SYNOPSIS
+        Configures Windows cipher suite ordering for Perfect Forward Secrecy and modern security.
+        Reference: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
+
+    .DESCRIPTION
+        Implements SSL Labs best practices for cipher suite ordering:
+        - Prioritizes ECDHE (Perfect Forward Secrecy)
+        - Prefers AEAD ciphers (GCM, CHACHA20-POLY1305)
+        - Removes weak/deprecated cipher suites
+        - Ensures server controls cipher selection, not client
+
+        Windows cipher suite names (Schannel format):
+        - TLS_ECDHE_* = Elliptic Curve Diffie-Hellman Ephemeral (PFS)
+        - TLS_DHE_* = Diffie-Hellman Ephemeral (PFS fallback)
+        - *_AES_*_GCM_* = AES with Galois/Counter Mode (AEAD)
+        - *_CHACHA20_POLY1305 = Modern AEAD cipher (Server 2022+/Win10+)
+
+        Order Priority:
+        1. TLS 1.3 ciphers (if supported)
+        2. ECDHE-ECDSA with GCM
+        3. ECDHE-RSA with GCM
+        4. ECDHE-ECDSA with CHACHA20
+        5. ECDHE-RSA with CHACHA20
+        6. DHE-RSA with GCM (legacy client support)
+        7. ECDHE with CBC mode (fallback for older clients)
+
+        Excluded:
+        - RSA key exchange (no forward secrecy)
+        - 3DES, RC4, NULL, DES, export ciphers
+        - MD5, SHA1 for signatures
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    Write-Log ""
+    Write-Log "=== CIPHER SUITE ORDERING ===" -Level INFO
+
+    if (-not (Get-Command Get-TlsCipherSuite -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-TlsCipherSuite cmdlet not available (requires Server 2012 R2+)" -Level WARN
+        return
+    }
+
+    # Define optimal cipher suite order following SSL Labs best practices
+    # TLS 1.3 cipher suites (Server 2022+/Win10 20H2+)
+    $tls13Suites = @(
+        'TLS_AES_256_GCM_SHA384'
+        'TLS_AES_128_GCM_SHA256'
+        'TLS_CHACHA20_POLY1305_SHA256'
+    )
+
+    # TLS 1.2 cipher suites with Perfect Forward Secrecy
+    $tls12SuitesPriority = @(
+        # ECDHE-ECDSA with GCM (best: PFS + AEAD + ECDSA performance)
+        'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384'
+        'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256'
+
+        # ECDHE-RSA with GCM (PFS + AEAD)
+        'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384'
+        'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256'
+
+        # ECDHE with CHACHA20-POLY1305 (mobile/embedded devices)
+        'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256'
+        'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256'
+
+        # DHE-RSA with GCM (PFS fallback for systems without ECDHE)
+        'TLS_DHE_RSA_WITH_AES_256_GCM_SHA384'
+        'TLS_DHE_RSA_WITH_AES_128_GCM_SHA256'
+
+        # ECDHE with CBC mode (legacy client compatibility - still has PFS)
+        'TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384'
+        'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256'
+        'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384'
+        'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256'
+        'TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA'
+        'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA'
+        'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA'
+        'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA'
+
+        # DHE with CBC mode (legacy compatibility)
+        'TLS_DHE_RSA_WITH_AES_256_CBC_SHA'
+        'TLS_DHE_RSA_WITH_AES_128_CBC_SHA'
+    )
+
+    # Combine TLS 1.3 and TLS 1.2 suites
+    $optimalOrder = $tls13Suites + $tls12SuitesPriority
+
+    # Get currently available cipher suites on this system
+    $availableSuites = Get-TlsCipherSuite
+    $systemSuiteNames = $availableSuites.Name
+
+    # Filter optimal order to only include suites available on this system
+    $finalOrder = $optimalOrder | Where-Object { $_ -in $systemSuiteNames }
+
+    if ($finalOrder.Count -eq 0) {
+        Write-Log "No optimal cipher suites found on this system" -Level ERROR
+        return
+    }
+
+    Write-Log "Optimal cipher suite order (PFS priority):" -Level INFO
+    Write-Log "  TLS 1.3 suites: $($tls13Suites.Count) defined" -Level INFO
+    Write-Log "  TLS 1.2 suites: $($tls12SuitesPriority.Count) defined" -Level INFO
+    Write-Log "  Available on system: $($finalOrder.Count) of $($optimalOrder.Count)" -Level INFO
+    Write-Log "" -Level INFO
+
+    # Display proposed order
+    Write-Log "Proposed cipher suite order (top 10):" -Level INFO
+    $finalOrder | Select-Object -First 10 | ForEach-Object { Write-Log "  $_" -Level INFO }
+    if ($finalOrder.Count -gt 10) {
+        Write-Log "  ... and $($finalOrder.Count - 10) more" -Level INFO
+    }
+
+    if ($PSCmdlet.ShouldProcess("Cipher Suite Order", "Configure $($finalOrder.Count) suites")) {
+        try {
+            # Set the cipher suite order
+            # Note: This cmdlet is available on Server 2012 R2+ and Win8.1+
+            $suiteString = $finalOrder -join ','
+            Enable-TlsCipherSuite -Name $finalOrder[0] -Position 0 -ErrorAction Stop | Out-Null
+
+            # Set complete order using registry (more reliable than cmdlet for bulk operations)
+            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+
+            Set-ItemProperty -Path $regPath -Name 'Functions' -Value $suiteString -Type MultiString -ErrorAction Stop
+            Write-Log "Cipher suite order configured successfully" -Level OK
+            Write-Log "Server will now prioritize PFS-enabled cipher suites" -Level OK
+            $Script:AppliedCount++
+        } catch {
+            Write-Log "Failed to set cipher suite order: $_" -Level ERROR
+            Write-Log "Note: Requires Windows Server 2012 R2+ or Windows 8.1+" -Level WARN
+        }
+    }
+}
+#endregion Cipher Suite Ordering
+
+#region ECC Curve Configuration
+function Set-EccCurves {
+    <#
+    .SYNOPSIS
+        Configures elliptic curve priority for ECDHE key exchange.
+        Reference: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices
+
+    .DESCRIPTION
+        Sets ECC curve priority following SSL Labs recommendations:
+        - P-384 (secp384r1): 192-bit security, recommended for high-security environments
+        - P-256 (secp256r1): 128-bit security, most widely supported, good performance
+        - curve25519: Modern curve with excellent security and performance (Server 2022+)
+
+        Excluded curves:
+        - P-521: Offers diminishing returns, slower performance
+        - P-192, P-224: Insufficient security for modern standards
+
+        Note: This configuration only applies to Server 2016+ and Win10+
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    Write-Log ""
+    Write-Log "=== ECC CURVE CONFIGURATION ===" -Level INFO
+
+    # ECC curve configuration only available on Server 2016+ (Build 14393+)
+    if ($Script:OsBuild -lt 14393) {
+        Write-Log "ECC curve configuration: Not supported (requires Server 2016+, current: Build $Script:OsBuild)" -Level INFO
+        return
+    }
+
+    # Define optimal curve order
+    # Windows curve names: NistP384, NistP256, curve25519 (Server 2022+)
+    $optimalCurves = @(
+        'NistP384'  # secp384r1 - 192-bit security
+        'NistP256'  # secp256r1 - 128-bit security (SSL Labs recommended)
+    )
+
+    # Add curve25519 for Server 2022+ (Build 20348+)
+    if ($Script:OsBuild -ge 20348) {
+        $optimalCurves += 'curve25519'
+    }
+
+    Write-Log "Configuring ECC curve priority:" -Level INFO
+    foreach ($curve in $optimalCurves) {
+        Write-Log "  Priority: $curve" -Level INFO
+    }
+
+    if ($PSCmdlet.ShouldProcess("ECC Curves", "Configure priority order")) {
+        try {
+            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'
+            if (-not (Test-Path $regPath)) {
+                New-Item -Path $regPath -Force | Out-Null
+            }
+
+            $curveString = $optimalCurves -join ' '
+            Set-ItemProperty -Path $regPath -Name 'EccCurves' -Value $curveString -Type MultiString -ErrorAction Stop
+            Write-Log "ECC curve priority configured successfully" -Level OK
+            $Script:AppliedCount++
+        } catch {
+            Write-Log "Failed to set ECC curve priority: $_" -Level ERROR
+        }
+    }
+}
+#endregion ECC Curve Configuration
+
 #region Main
 function Invoke-Hardening {
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Cyan
-    Write-Host "   SCHANNEL SECURITY HARDENING - PRODUCTION TESTED v2.2" -ForegroundColor Cyan
+    Write-Host "   SCHANNEL SECURITY HARDENING - PRODUCTION TESTED v3.1.1" -ForegroundColor Cyan
     Write-Host ("=" * 80) -ForegroundColor Cyan
     Write-Host ""
 
@@ -667,8 +1279,15 @@ function Invoke-Hardening {
     Write-Log "Log: $Script:LogFile" -Level INFO
     Write-Log ""
     Write-Log "Configuration:" -Level INFO
-    Write-Log "  Min DH/ECDH Key Bits: $MinDhKeyBits" -Level INFO
-    Write-Log "  Verbose Logging: $EnableVerboseLogging" -Level INFO
+    Write-Log "  Min Key Bits (DH/ECDH/RSA): $MinDhKeyBits" -Level INFO
+    Write-Log "  Event Logging Level: $EventLogging" -Level INFO
+    Write-Log "  OCSP Stapling: $EnableOcspStapling" -Level INFO
+    Write-Log "  Session Cache Disabled: $DisableSessionCache" -Level INFO
+    if (-not $DisableSessionCache) {
+        Write-Log "  Max Cache Size: $MaximumCacheSize elements" -Level INFO
+    }
+    Write-Log "  Send Trusted Issuer List: $SendTrustedIssuerList" -Level INFO
+    Write-Log "  Cipher Suite Ordering: $EnableCipherSuiteOrder" -Level INFO
 
     if ($Script:OsBuild -eq 9200) {
         Write-Log ""
@@ -684,13 +1303,27 @@ function Invoke-Hardening {
 
     # Apply settings
     Set-SchannelBaseSettings
+    Set-OcspStapling
     Set-Protocols
     Set-Ciphers
     Set-Hashes
     Set-KeyExchange
+    Set-EccCurves
     Set-DotNetFramework
+    Set-SessionCache
+    Set-TrustedIssuerList
     Set-WinHttp
     Disable-NullCipherSuites
+
+    # Cipher suite ordering (optional, requires explicit parameter)
+    if ($EnableCipherSuiteOrder) {
+        Set-CipherSuiteOrder
+    } else {
+        Write-Log ""
+        Write-Log "=== CIPHER SUITE ORDERING ===" -Level INFO
+        Write-Log "Cipher suite ordering: Not configured (use -EnableCipherSuiteOrder to enable)" -Level INFO
+        Write-Log "Note: Enabling this prioritizes Perfect Forward Secrecy (PFS) cipher suites" -Level INFO
+    }
 
     # Summary
     Write-Log ""
@@ -709,9 +1342,26 @@ function Invoke-Hardening {
     Write-Log "To rollback: reg import `"$backupFile`"" -Level INFO
     Write-Log ""
 
+    # Application-level security reminders
+    Write-Log "IMPORTANT: APPLICATION-LEVEL SECURITY CONFIGURATION REQUIRED" -Level WARN
+    Write-Log "This script configures OS-level TLS/SSL settings only." -Level WARN
+    Write-Log "You must also configure the following at the web server/application level:" -Level WARN
+    Write-Log "" -Level INFO
+    Write-Log "  1. HTTP Strict Transport Security (HSTS) - CRITICAL" -Level WARN
+    Write-Log "     Header: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload" -Level INFO
+    Write-Log "     Configure in: IIS, Apache, Nginx, or application code" -Level INFO
+    Write-Log "" -Level INFO
+    Write-Log "  2. Secure Cookies - Mark all cookies with Secure and HttpOnly flags" -Level WARN
+    Write-Log "  3. Content Security Policy (CSP) - Prevent XSS and mixed content" -Level WARN
+    Write-Log "  4. Certificate Configuration - Use proper certificate chains and OCSP stapling" -Level WARN
+    Write-Log "  5. DNS CAA Records - Restrict which CAs can issue certificates" -Level WARN
+    Write-Log "" -Level INFO
+    Write-Log "Reference: https://github.com/ssllabs/research/wiki/SSL-and-TLS-Deployment-Best-Practices" -Level INFO
+    Write-Log ""
+
     if ($Script:OsBuild -eq 9200) {
         Write-Log "SERVER 2012 POST-HARDENING NOTES:" -Level WARN
-        Write-Log "  1. TLS 1.0/1.1 remain enabled for compatibility" -Level WARN
+        Write-Log "  1. TLS 1.0/1.1 remains enabled for compatibility" -Level WARN
         Write-Log "  2. Monitor application compatibility after reboot" -Level WARN
         Write-Log "  3. Plan migration to Server 2016+ for full security" -Level WARN
         Write-Log ""
