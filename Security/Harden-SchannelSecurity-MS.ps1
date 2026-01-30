@@ -49,7 +49,7 @@
 
     Key Exchange Algorithms:
     - Diffie-Hellman: Enabled, MinKeyBitLength=2048 (configurable 1024-4096)
-    - ECDH: Enabled, ClientMinKeyBitLength=2048, EphemKeyReuseTime=0 (Server 2022+)
+    - ECDH: Enabled, curve policy via EccCurves, EphemKeyReuseTime=0 (Server 2022+)
     - PKCS/RSA: Enabled, ClientMinKeyBitLength=2048 (NEW in v3.0.0)
     - ECC Curve Priority: P-384, P-256, curve25519 (Server 2016+)
 
@@ -110,7 +110,7 @@
     - Server 2022+ (Build 20348+): Enhanced PFS with EphemKeyReuseTime=0
 
 .PARAMETER MinDhKeyBits
-    Minimum key length for Diffie-Hellman, ECDH, and PKCS/RSA key exchange algorithms.
+    Minimum key length for Diffie-Hellman and PKCS/RSA key exchange algorithms.
     Valid values: 1024, 2048, 3072, 4096
     Default: 2048
     Recommendation: Use 2048 minimum, 3072 for high-security environments
@@ -240,7 +240,7 @@
 
 .EXAMPLE
     .\Harden-SchannelSecurity-MS.ps1 -MinDhKeyBits 3072
-    Use 3072-bit minimum key length for DH/ECDH/RSA (high-security).
+    Use 3072-bit minimum key length for DH/RSA (high-security).
 
 .EXAMPLE
     .\Harden-SchannelSecurity-MS.ps1 -EventLogging 7
@@ -268,8 +268,8 @@
 
 .NOTES
     Author:         Karol Kula (cquresphere)
-    Version:        3.1.1
-    Last Updated:   2026-01-22
+    Version:        3.1.2
+    Last Updated:   2026-01-30
     Tested On:      Windows Server 2012, 2012 R2, 2016, 2019, 2022
 
     References:
@@ -291,6 +291,7 @@
     - Reboot required after execution
 
     Changelog:
+    - 3.1.2: Fixed ECDH min key length handling and ECC curve policy format
     - 3.1.1: Fixed registry backup failing for paths containing spaces (e.g., WinHttp keys under
              "Internet Settings") by adding proper quoting in reg export arguments
     - 3.1.0: Added TLS compression disable (CRIME mitigation), cipher suite ordering (PFS priority),
@@ -846,10 +847,10 @@ function Set-KeyExchange {
     Set-RegistryValue -Path $dhPath -Name 'ClientMinKeyBitLength' -Value $MinDhKeyBits -Description "DH ClientMinKeyBitLength"
 
     # ECDH
-    Write-Log "Configuring ECDH (ClientMinKeyBitLength=$MinDhKeyBits)" -Level INFO
+    Write-Log "Configuring ECDH (curve policy)" -Level INFO
     $ecdhPath = "$Script:SchannelBase\KeyExchangeAlgorithms\ECDH"
     Set-RegistryValue -Path $ecdhPath -Name 'Enabled' -Value 0xFFFFFFFF -Description "ECDH Enabled"
-    Set-RegistryValue -Path $ecdhPath -Name 'ClientMinKeyBitLength' -Value $MinDhKeyBits -Description "ECDH ClientMinKeyBitLength"
+    Remove-RegistryValue -Path $ecdhPath -Name 'ClientMinKeyBitLength' -Description "ECDH ClientMinKeyBitLength (use curve policy)"
 
     # EphemKeyReuseTime - Only effective on Server 2022+ (Build 20348+)
     # Setting to 0 = never reuse ephemeral keys (maximum PFS)
@@ -1249,8 +1250,7 @@ function Set-EccCurves {
                 New-Item -Path $regPath -Force | Out-Null
             }
 
-            $curveString = $optimalCurves -join ' '
-            Set-ItemProperty -Path $regPath -Name 'EccCurves' -Value $curveString -Type MultiString -ErrorAction Stop
+            Set-ItemProperty -Path $regPath -Name 'EccCurves' -Value $optimalCurves -Type MultiString -ErrorAction Stop
             Write-Log "ECC curve priority configured successfully" -Level OK
             $Script:AppliedCount++
         } catch {
@@ -1264,7 +1264,7 @@ function Set-EccCurves {
 function Invoke-Hardening {
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Cyan
-    Write-Host "   SCHANNEL SECURITY HARDENING - PRODUCTION TESTED v3.1.1" -ForegroundColor Cyan
+    Write-Host "   SCHANNEL SECURITY HARDENING - PRODUCTION TESTED v3.1.2" -ForegroundColor Cyan
     Write-Host ("=" * 80) -ForegroundColor Cyan
     Write-Host ""
 
@@ -1279,7 +1279,7 @@ function Invoke-Hardening {
     Write-Log "Log: $Script:LogFile" -Level INFO
     Write-Log ""
     Write-Log "Configuration:" -Level INFO
-    Write-Log "  Min Key Bits (DH/ECDH/RSA): $MinDhKeyBits" -Level INFO
+    Write-Log "  Min Key Bits (DH/RSA): $MinDhKeyBits" -Level INFO
     Write-Log "  Event Logging Level: $EventLogging" -Level INFO
     Write-Log "  OCSP Stapling: $EnableOcspStapling" -Level INFO
     Write-Log "  Session Cache Disabled: $DisableSessionCache" -Level INFO
@@ -1361,7 +1361,7 @@ function Invoke-Hardening {
 
     if ($Script:OsBuild -eq 9200) {
         Write-Log "SERVER 2012 POST-HARDENING NOTES:" -Level WARN
-        Write-Log "  1. TLS 1.0/1.1 remains enabled for compatibility" -Level WARN
+        Write-Log "  1. TLS 1.0/1.1 remain enabled for compatibility" -Level WARN
         Write-Log "  2. Monitor application compatibility after reboot" -Level WARN
         Write-Log "  3. Plan migration to Server 2016+ for full security" -Level WARN
         Write-Log ""
