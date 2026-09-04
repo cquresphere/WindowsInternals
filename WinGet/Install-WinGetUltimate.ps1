@@ -5,6 +5,7 @@
 .DESCRIPTION
     Comprehensive script that handles:
     - Admin privilege verification
+    - Execution-context detection (SYSTEM vs. interactive admin)
     - OS compatibility checks
     - Visual C++ Redistributable installation
     - WinGet dependencies (VCLibs, UI.Xaml)
@@ -12,6 +13,9 @@
         1. Repair-WinGetPackageManager (Microsoft.WinGet.Client module)
         2. Direct download from GitHub releases with license provisioning
         3. aka.ms/getwinget shortcut download
+    - Functional (not merely presence-based) winget detection
+    - Repair of the "provisioned but not registered" state that produces
+      ApplicationFailedException / Win32 1920 (ERROR_CANT_ACCESS_FILE)
     - WinGet Source MSIX registration (fixes 0x8a15000f)
     - PATH environment variable configuration
     - WindowsApps folder permissions fix
@@ -38,9 +42,18 @@
     # Force reinstallation with detailed output
 
 .NOTES
-    Version : 1.0.0
+    Version : 1.1.0
     Author  : Karol Kula
     Requires: Administrator privileges, Windows 10 1809+ or Server 2019+
+
+    v1.1.0 - Detection layer rewritten.
+             winget.exe is never invoked as a bare native command. The App
+             Execution Alias in %LOCALAPPDATA%\Microsoft\WindowsApps is a
+             zero-byte reparse stub that exists even when the MSIX package is
+             not registered for the calling identity; invoking it raises a
+             NativeCommandFailed / ApplicationFailedException that 2>$null
+             does not suppress and that $ErrorActionPreference='Stop' turns
+             into a script-terminating error.
 #>
 
 #Requires -RunAsAdministrator
@@ -54,6 +67,9 @@ param (
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
+
+$script:WinGetFamilyName  = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+$script:WinGetPackageName = 'Microsoft.DesktopAppInstaller'
 
 # ============================================================================ #
 #  Helper Functions
@@ -105,74 +121,388 @@ function Test-AdminPrivileges {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-OSInfo {
+function Test-IsSystemContext {
     <#
     .SYNOPSIS
-        Returns OS version, type (Workstation/Server), and architecture.
-    #>
-    $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem
-    $arch = ($os.OSArchitecture -replace "[^\d]").Trim()
-    if ($arch -eq "64") { $arch = "x64" } elseif ($arch -eq "32") { $arch = "x86" }
-
-    $isServer = $os.Caption -match "Server"
-    $numericVersion = if ($isServer) {
-        # Extract year from caption for server
-        if ($os.Caption -match "(\d{4})") { [int]$Matches[1] } else { 0 }
-    } else {
-        [System.Environment]::OSVersion.Version.Major
-    }
-
-    $releaseId = $reg.ReleaseId
-    if ([string]::IsNullOrEmpty($releaseId)) {
-        $releaseId = $reg.DisplayVersion
-    }
-
-    [PSCustomObject]@{
-        Name           = $os.Caption
-        Type           = if ($isServer) { "Server" } else { "Workstation" }
-        NumericVersion = $numericVersion
-        ReleaseId      = $releaseId
-        Architecture   = $arch
-        BuildNumber    = $os.BuildNumber
-    }
-}
-
-function Test-WinGetCommand {
-    <#
-    .SYNOPSIS
-        Tests if winget.exe is available as a command.
+        Returns $true when running as LocalSystem (S-1-5-18).
+    .DESCRIPTION
+        App Execution Aliases are a per-user MSIX construct and never resolve
+        under SYSTEM. Intune platform scripts, ConfigMgr and PsExec all land
+        here, so the alias path must be excluded and winget.exe invoked from
+        its WindowsApps package folder directly.
     #>
     try {
-        $null = Get-Command winget.exe -ErrorAction Stop
-        return $true
+        return ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
     } catch {
         return $false
     }
 }
 
-function Test-WinGetExists {
+function ConvertTo-SafeVersion {
     <#
     .SYNOPSIS
-        Tests if winget.exe exists in WindowsApps, even if not on PATH.
+        Best-effort [version] conversion; returns 0.0.0.0 on failure so that
+        Sort-Object never throws on a malformed package folder name.
     #>
-    $paths = @(Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*__8wekyb3d8bbwe\winget.exe" -ErrorAction SilentlyContinue)
-    return ($paths.Count -gt 0)
+    param([string]$InputString)
+    $v = $null
+    if ([version]::TryParse($InputString, [ref]$v)) { return $v }
+    return [version]'0.0.0.0'
+}
+
+function Get-WinGetLaunchDiagnosis {
+    <#
+    .SYNOPSIS
+        Maps a Win32 error code from a failed CreateProcess into an actionable cause.
+    #>
+    param([int]$NativeErrorCode)
+
+    switch ($NativeErrorCode) {
+        1920   { 'ERROR_CANT_ACCESS_FILE (1920) - the App Execution Alias resolved to a package that is NOT registered for the calling identity. Typical on Server SKUs, freshly provisioned packages and SYSTEM context.' }
+        2      { 'ERROR_FILE_NOT_FOUND (2) - the alias points at a DesktopAppInstaller version that has been removed or upgraded away.' }
+        5      { 'ERROR_ACCESS_DENIED (5) - WindowsApps ACL, AppLocker or WDAC policy is blocking execution.' }
+        216    { 'ERROR_EXE_MACHINE_TYPE_MISMATCH (216) - architecture mismatch (e.g. x64 binary on ARM64 without emulation).' }
+        740    { 'ERROR_ELEVATION_REQUIRED (740) - the process requires elevation.' }
+        default { "Win32 error $NativeErrorCode." }
+    }
+}
+
+function Invoke-WinGetProcess {
+    <#
+    .SYNOPSIS
+        Invokes winget.exe out-of-process without ever using PowerShell's native
+        command operator.
+    .DESCRIPTION
+        The call operator (&) surfaces a failed CreateProcess as a
+        NativeCommandFailed / ApplicationFailedException error record. That
+        record is NOT stderr, so 2>$null does not suppress it, and under
+        $ErrorActionPreference = 'Stop' it terminates the script.
+
+        System.Diagnostics.Process throws a catchable Win32Exception instead,
+        and exposes NativeErrorCode, which is what actually identifies the
+        failure mode (1920 vs 5 vs 2).
+    .OUTPUTS
+        PSCustomObject with Ran, ExitCode, StdOut, StdErr, NativeErrorCode, ErrorMessage.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ExePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 120
+    )
+
+    $result = [PSCustomObject]@{
+        Ran             = $false
+        ExitCode        = $null
+        StdOut          = ''
+        StdErr          = ''
+        NativeErrorCode = $null
+        ErrorMessage    = $null
+        TimedOut        = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        $result.ErrorMessage = "Path does not exist: $ExePath"
+        return $result
+    }
+
+    $quoted = $Arguments | ForEach-Object {
+        if ($_ -match '\s') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $ExePath
+    $psi.Arguments              = ($quoted -join ' ')
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    # winget emits UTF-8; without this the console codepage mangles output on
+    # non-English systems (and breaks any downstream string matching).
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    try {
+        [void]$proc.Start()
+    } catch [System.ComponentModel.Win32Exception] {
+        $result.NativeErrorCode = $_.Exception.NativeErrorCode
+        $result.ErrorMessage    = Get-WinGetLaunchDiagnosis -NativeErrorCode $_.Exception.NativeErrorCode
+        $proc.Dispose()
+        return $result
+    } catch {
+        $result.ErrorMessage = $_.Exception.Message
+        $proc.Dispose()
+        return $result
+    }
+
+    # Read asynchronously before WaitForExit to avoid the classic pipe-buffer deadlock.
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill() } catch { }
+        $result.TimedOut     = $true
+        $result.ErrorMessage = "winget.exe did not exit within $TimeoutSeconds seconds."
+        $proc.Dispose()
+        return $result
+    }
+
+    try { $result.StdOut = $outTask.GetAwaiter().GetResult() } catch { }
+    try { $result.StdErr = $errTask.GetAwaiter().GetResult() } catch { }
+
+    $result.Ran      = $true
+    $result.ExitCode = $proc.ExitCode
+    $proc.Dispose()
+    return $result
+}
+
+function Get-WinGetPackage {
+    <#
+    .SYNOPSIS
+        Resolves the highest-version DesktopAppInstaller package and its real
+        winget.exe path.
+    .DESCRIPTION
+        Primary source is the Appx stack (Get-AppxPackage -AllUsers), which
+        works under SYSTEM and does not depend on being able to enumerate
+        C:\Program Files\WindowsApps - Administrators are denied traversal on
+        parts of that tree by default, which is why filesystem globbing is only
+        the fallback here.
+
+        Version ordering is done with [version], not lexical Sort-Object Path:
+        lexically, "1.9.x" sorts after "1.24.x", which selects the wrong package.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $pkg = $null
+
+    try {
+        $pkg = Get-AppxPackage -AllUsers -Name $script:WinGetPackageName -ErrorAction Stop |
+               Where-Object { $_.InstallLocation } |
+               Sort-Object { ConvertTo-SafeVersion $_.Version } |
+               Select-Object -Last 1
+    } catch {
+        Write-Verbose "Get-AppxPackage -AllUsers failed: $($_.Exception.Message)"
+    }
+
+    if (-not $pkg) {
+        try {
+            $pkg = Get-AppxPackage -Name $script:WinGetPackageName -ErrorAction SilentlyContinue |
+                   Where-Object { $_.InstallLocation } |
+                   Sort-Object { ConvertTo-SafeVersion $_.Version } |
+                   Select-Object -Last 1
+        } catch {
+            Write-Verbose "Get-AppxPackage failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($pkg -and $pkg.InstallLocation) {
+        return [PSCustomObject]@{
+            Source          = 'AppxPackage'
+            Version         = $pkg.Version
+            InstallLocation = $pkg.InstallLocation
+            ExePath         = Join-Path $pkg.InstallLocation 'winget.exe'
+            ManifestPath    = Join-Path $pkg.InstallLocation 'AppXManifest.xml'
+            PackageFullName = $pkg.PackageFullName
+        }
+    }
+
+    # Fallback: enumerate WindowsApps directly.
+    $roots = @($env:ProgramFiles, $env:ProgramW6432) |
+             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+             ForEach-Object { Join-Path $_ 'WindowsApps' } |
+             Select-Object -Unique
+
+    $candidates = foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Get-ChildItem -LiteralPath $root -Directory -Filter "$($script:WinGetPackageName)_*__8wekyb3d8bbwe" -ErrorAction SilentlyContinue
+    }
+
+    $best = $candidates |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'winget.exe') } |
+            Sort-Object { ConvertTo-SafeVersion ($_.Name -split '_')[1] } |
+            Select-Object -Last 1
+
+    if ($best) {
+        return [PSCustomObject]@{
+            Source          = 'FileSystem'
+            Version         = ($best.Name -split '_')[1]
+            InstallLocation = $best.FullName
+            ExePath         = Join-Path $best.FullName 'winget.exe'
+            ManifestPath    = Join-Path $best.FullName 'AppXManifest.xml'
+            PackageFullName = $best.Name
+        }
+    }
+
+    return $null
 }
 
 function Get-WinGetExePath {
     <#
     .SYNOPSIS
-        Returns the folder path of the latest winget.exe in WindowsApps.
+        Returns the folder path of the resolved winget package (back-compat shim).
     #>
-    $resolved = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" -ErrorAction SilentlyContinue
-    if (-not $resolved) {
-        $resolved = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*__8wekyb3d8bbwe" -ErrorAction SilentlyContinue
-    }
-    if ($resolved) {
-        return ($resolved | Sort-Object Path | Select-Object -Last 1).Path
-    }
+    $pkg = Get-WinGetPackage
+    if ($pkg) { return $pkg.InstallLocation }
     return $null
+}
+
+function Test-WinGetExists {
+    <#
+    .SYNOPSIS
+        Tests whether winget binaries exist on disk, regardless of runnability.
+    #>
+    $pkg = Get-WinGetPackage
+    return ($null -ne $pkg -and (Test-Path -LiteralPath $pkg.ExePath))
+}
+
+function Test-WinGetFunctional {
+    <#
+    .SYNOPSIS
+        Determines whether winget can actually be executed, and via which path.
+    .DESCRIPTION
+        Replaces the old Get-Command probe. Get-Command succeeds on the
+        zero-byte App Execution Alias stub, so it reports "installed" on exactly
+        the machines that are broken.
+
+        Candidates are tried in order of trustworthiness:
+          1. The WindowsApps package binary (authoritative, works under SYSTEM)
+          2. The per-user App Execution Alias (skipped under SYSTEM)
+          3. Whatever is on PATH
+    .OUTPUTS
+        PSCustomObject: Working, ExePath, Version, Kind, BinaryPresent,
+                        FailureReason, NativeErrorCode, Attempts.
+    #>
+    [CmdletBinding()]
+    param([switch]$AllowAlias)
+
+    $isSystem   = Test-IsSystemContext
+    $pkg        = Get-WinGetPackage
+    $candidates = New-Object System.Collections.Generic.List[object]
+
+    if ($pkg -and (Test-Path -LiteralPath $pkg.ExePath)) {
+        $candidates.Add([PSCustomObject]@{ Kind = 'Package'; Path = $pkg.ExePath })
+    }
+
+    if ((-not $isSystem -or $AllowAlias) -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        # $env:LOCALAPPDATA is absent in some service contexts; guard it, because
+        # $ErrorActionPreference = 'Stop' would turn a null Join-Path into a
+        # terminating error inside the detection routine itself.
+        $aliasPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+        if (Test-Path -LiteralPath $aliasPath) {
+            $candidates.Add([PSCustomObject]@{ Kind = 'Alias'; Path = $aliasPath })
+        }
+    } elseif ($isSystem) {
+        Write-Verbose 'SYSTEM context detected - App Execution Alias excluded from candidates.'
+    }
+
+    $onPath = Get-Command -Name 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+    if ($onPath) {
+        $candidates.Add([PSCustomObject]@{ Kind = 'Path'; Path = $onPath.Source })
+    }
+
+    $seen     = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $attempts = New-Object System.Collections.Generic.List[object]
+
+    $state = [PSCustomObject]@{
+        Working         = $false
+        ExePath         = $null
+        Version         = $null
+        Kind            = $null
+        BinaryPresent   = ($null -ne $pkg)
+        IsSystemContext = $isSystem
+        FailureReason   = $null
+        NativeErrorCode = $null
+        Attempts        = $attempts
+    }
+
+    foreach ($candidate in $candidates) {
+        if (-not $seen.Add($candidate.Path)) { continue }
+
+        $run = Invoke-WinGetProcess -ExePath $candidate.Path -Arguments @('--version') -TimeoutSeconds 45
+        $attempts.Add([PSCustomObject]@{
+            Kind            = $candidate.Kind
+            Path            = $candidate.Path
+            Ran             = $run.Ran
+            ExitCode        = $run.ExitCode
+            NativeErrorCode = $run.NativeErrorCode
+            Message         = $run.ErrorMessage
+        })
+
+        if ($run.Ran -and $run.ExitCode -eq 0) {
+            $state.Working = $true
+            $state.ExePath = $candidate.Path
+            $state.Kind    = $candidate.Kind
+            $state.Version = ($run.StdOut -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
+            return $state
+        }
+
+        Write-Verbose "Candidate [$($candidate.Kind)] '$($candidate.Path)' failed: $($run.ErrorMessage) (exit $($run.ExitCode))"
+        if ($null -eq $state.NativeErrorCode -and $null -ne $run.NativeErrorCode) {
+            $state.NativeErrorCode = $run.NativeErrorCode
+            $state.FailureReason   = $run.ErrorMessage
+        }
+    }
+
+    if (-not $state.FailureReason) {
+        $state.FailureReason = if ($candidates.Count -eq 0) {
+            'No winget.exe candidate found on this system.'
+        } else {
+            'All winget.exe candidates failed to produce a version.'
+        }
+    }
+
+    return $state
+}
+
+function Repair-WinGetRegistration {
+    <#
+    .SYNOPSIS
+        Re-registers an already-present DesktopAppInstaller package for the
+        current user. This is the fix for Win32 1920.
+    .DESCRIPTION
+        When a package is provisioned (staged to WindowsApps) but not registered
+        for the calling user, the alias stub exists and the payload does not
+        resolve. Registration is per-user and therefore meaningless under
+        SYSTEM - there the correct answer is to invoke the package binary
+        directly, which Test-WinGetFunctional already does.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (Test-IsSystemContext) {
+        Write-Verbose 'SYSTEM context: per-user registration is not applicable; direct package-path invocation is used instead.'
+        return $false
+    }
+
+    $pkg = Get-WinGetPackage
+    if (-not $pkg) {
+        Write-Verbose 'No DesktopAppInstaller package found to re-register.'
+        return $false
+    }
+
+    if (Test-Path -LiteralPath $pkg.ManifestPath) {
+        try {
+            Write-Verbose "Registering manifest: $($pkg.ManifestPath)"
+            Add-AppxPackage -DisableDevelopmentMode -Register $pkg.ManifestPath -ErrorAction Stop
+            return $true
+        } catch {
+            Write-Verbose "Manifest registration failed: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Write-Verbose "Registering by family name: $($script:WinGetFamilyName)"
+        Add-AppxPackage -RegisterByFamilyName -MainPackage $script:WinGetFamilyName -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Verbose "RegisterByFamilyName failed: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Test-VCRedistInstalled {
@@ -197,6 +527,38 @@ function Test-VCRedistInstalled {
     return $false
 }
 
+function Get-OSInfo {
+    <#
+    .SYNOPSIS
+        Returns OS version, type (Workstation/Server), and architecture.
+    #>
+    $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    $arch = ($os.OSArchitecture -replace "[^\d]").Trim()
+    if ($arch -eq "64") { $arch = "x64" } elseif ($arch -eq "32") { $arch = "x86" }
+
+    $isServer = $os.Caption -match "Server"
+    $numericVersion = if ($isServer) {
+        if ($os.Caption -match "(\d{4})") { [int]$Matches[1] } else { 0 }
+    } else {
+        [System.Environment]::OSVersion.Version.Major
+    }
+
+    $releaseId = $reg.ReleaseId
+    if ([string]::IsNullOrEmpty($releaseId)) {
+        $releaseId = $reg.DisplayVersion
+    }
+
+    [PSCustomObject]@{
+        Name           = $os.Caption
+        Type           = if ($isServer) { "Server" } else { "Workstation" }
+        NumericVersion = $numericVersion
+        ReleaseId      = $releaseId
+        Architecture   = $arch
+        BuildNumber    = $os.BuildNumber
+    }
+}
+
 function Install-NuGetIfRequired {
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
         if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -214,23 +576,35 @@ function Add-WinGetToPath {
     <#
     .SYNOPSIS
         Adds winget folder to system and process PATH if not already present.
+    .DESCRIPTION
+        Note: the WindowsApps package folder name contains the package version,
+        so a persisted machine PATH entry becomes stale on every winget update.
+        Stale entries are pruned here to stop them accumulating.
     #>
     param([string]$WinGetFolder)
 
     if ([string]::IsNullOrEmpty($WinGetFolder)) { return }
 
-    # Add to current process
     if (-not ($env:PATH -split ';' | Where-Object { $_ -eq $WinGetFolder })) {
         $env:PATH += ";$WinGetFolder"
         Write-Verbose "Added '$WinGetFolder' to process PATH."
     }
 
-    # Add to system PATH persistently
     $systemPath = [System.Environment]::GetEnvironmentVariable('PATH', [System.EnvironmentVariableTarget]::Machine)
-    if (-not ($systemPath -split ';' | Where-Object { $_ -eq $WinGetFolder })) {
-        $systemPath = $systemPath.TrimEnd(';') + ";$WinGetFolder"
-        [System.Environment]::SetEnvironmentVariable('PATH', $systemPath, [System.EnvironmentVariableTarget]::Machine)
-        Write-Verbose "Added '$WinGetFolder' to system PATH."
+    $entries = @($systemPath -split ';' | Where-Object { $_ })
+
+    # Drop stale versioned DesktopAppInstaller entries other than the current one.
+    $pruned = @($entries | Where-Object {
+        ($_ -notlike "*$($script:WinGetPackageName)_*") -or ($_ -eq $WinGetFolder)
+    })
+
+    if (-not ($pruned | Where-Object { $_ -eq $WinGetFolder })) {
+        $pruned += $WinGetFolder
+    }
+
+    if (($pruned -join ';') -ne ($entries -join ';')) {
+        [System.Environment]::SetEnvironmentVariable('PATH', ($pruned -join ';'), [System.EnvironmentVariableTarget]::Machine)
+        Write-Verbose "Updated system PATH (current winget folder: '$WinGetFolder')."
     }
 }
 
@@ -238,6 +612,11 @@ function Set-WinGetFolderPermissions {
     <#
     .SYNOPSIS
         Grants Administrators full control over the winget folder (language-independent SID).
+    .NOTES
+        Modifying ACLs under C:\Program Files\WindowsApps changes MSIX package
+        integrity for every packaged app on the box and is flagged by CIS and
+        the Microsoft security baselines. Prefer invoking winget.exe by its
+        resolved package path over relaxing these ACLs.
     #>
     param([string]$FolderPath)
 
@@ -272,6 +651,10 @@ if (-not (Test-AdminPrivileges)) {
 }
 Write-Success "Running as Administrator"
 
+if (Test-IsSystemContext) {
+    Write-Host "  Context: LocalSystem (S-1-5-18) - App Execution Aliases will be bypassed." -ForegroundColor Gray
+}
+
 $osInfo = Get-OSInfo
 Write-Host "  OS: $($osInfo.Name) ($($osInfo.Architecture))" -ForegroundColor Gray
 Write-Host "  Build: $($osInfo.BuildNumber), Release: $($osInfo.ReleaseId)" -ForegroundColor Gray
@@ -293,12 +676,45 @@ if ($osInfo.Type -eq "Server" -and $osInfo.NumericVersion -lt 2019) {
 
 Write-Success "OS is compatible"
 
-# Check if already installed
-if ((Test-WinGetCommand) -and -not $Force) {
-    $wingetVer = & winget.exe --version 2>$null
-    Write-Success "WinGet is already installed and working (version: $wingetVer)"
+# ---------------------------------------------------------------------------- #
+#  Functional detection + in-place repair before falling through to reinstall
+# ---------------------------------------------------------------------------- #
+
+$wingetState = Test-WinGetFunctional
+
+if ($wingetState.Working -and -not $Force) {
+    Write-Success "WinGet is already installed and working (version: $($wingetState.Version))"
+    Write-Host "  Resolved via [$($wingetState.Kind)]: $($wingetState.ExePath)" -ForegroundColor Gray
     Write-Host "`nUse -Force to reinstall." -ForegroundColor Yellow
     exit 0
+}
+
+if (-not $wingetState.Working -and $wingetState.BinaryPresent) {
+    Write-Info "winget binaries are present but not runnable."
+    Write-Host "  Reason: $($wingetState.FailureReason)" -ForegroundColor Gray
+    foreach ($attempt in $wingetState.Attempts) {
+        Write-Verbose "  [$($attempt.Kind)] $($attempt.Path) -> ran=$($attempt.Ran) exit=$($attempt.ExitCode) win32=$($attempt.NativeErrorCode)"
+    }
+
+    Write-Info "Attempting in-place re-registration before reinstalling..."
+    if (Repair-WinGetRegistration) {
+        Start-Sleep -Seconds 2
+        $wingetState = Test-WinGetFunctional
+        if ($wingetState.Working) {
+            Write-Success "WinGet repaired by re-registration (version: $($wingetState.Version))"
+            if (-not $Force) {
+                Write-Host "  Resolved via [$($wingetState.Kind)]: $($wingetState.ExePath)" -ForegroundColor Gray
+                Write-Host "`nUse -Force to reinstall anyway." -ForegroundColor Yellow
+                exit 0
+            }
+        } else {
+            Write-Info "Re-registration did not restore winget; continuing with full installation."
+        }
+    } else {
+        Write-Info "Re-registration not applicable or failed; continuing with full installation."
+    }
+} elseif (-not $wingetState.Working) {
+    Write-Info "WinGet not detected. Proceeding with installation."
 }
 
 # ============================================================================ #
@@ -322,7 +738,6 @@ if (Test-VCRedistInstalled) {
         Invoke-WebRequest -Uri $vcUrl -OutFile $vcPath -UseBasicParsing
         Start-Process -FilePath $vcPath -ArgumentList "/install", "/quiet", "/norestart" -Wait
 
-        # Also install x86 on 64-bit systems for full compatibility
         if ($arch -eq "x64") {
             $vcUrlX86 = "https://aka.ms/vs/17/release/vc_redist.x86.exe"
             $vcPathX86 = Join-Path $tempFolder "vc_redist.x86.exe"
@@ -367,7 +782,7 @@ try {
 
             Start-Sleep -Seconds 3
 
-            if (Test-WinGetExists) {
+            if ((Test-WinGetFunctional).Working) {
                 Write-Success "WinGet installed via Repair-WinGetPackageManager"
                 $installSuccess = $true
             }
@@ -388,13 +803,11 @@ try {
             $arch = $osInfo.Architecture
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-            # Download VCLibs dependency
             $vclibsUrl = "https://aka.ms/Microsoft.VCLibs.$arch.14.00.Desktop.appx"
             $vclibsPath = Join-Path $tempFolder "Microsoft.VCLibs.appx"
             Write-Verbose "Downloading VCLibs..."
             Invoke-WebRequest -Uri $vclibsUrl -OutFile $vclibsPath -UseBasicParsing
 
-            # Download UI.Xaml dependency
             $uiXamlZipUrl = "https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6"
             $uiXamlZipPath = Join-Path $tempFolder "Microsoft.UI.Xaml.zip"
             Write-Verbose "Downloading UI.Xaml from NuGet..."
@@ -402,31 +815,26 @@ try {
             Expand-Archive -Path $uiXamlZipPath -DestinationPath (Join-Path $tempFolder "UIXaml") -Force
             $uiXamlAppxPath = Join-Path $tempFolder "UIXaml\tools\AppX\$arch\Release\Microsoft.UI.Xaml.2.8.appx"
 
-            # Get latest winget release info from GitHub
             $releasesUri = "https://api.github.com/repos/microsoft/winget-cli/releases/latest"
             Write-Verbose "Querying GitHub for latest winget release..."
             $releaseInfo = Invoke-RestMethod -Uri $releasesUri -Method Get -ErrorAction Stop
 
-            # Download winget msixbundle
             $bundleAsset = $releaseInfo.assets | Where-Object { $_.name -like "*Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" }
             $bundlePath = Join-Path $tempFolder $bundleAsset.name
             Write-Verbose "Downloading $($bundleAsset.name)..."
             Invoke-WebRequest -Uri $bundleAsset.browser_download_url -OutFile $bundlePath -UseBasicParsing
 
-            # Download license
             $licenseAsset = $releaseInfo.assets | Where-Object { $_.name -like "*_License1.xml" }
             $licensePath = Join-Path $tempFolder $licenseAsset.name
             Write-Verbose "Downloading license..."
             Invoke-WebRequest -Uri $licenseAsset.browser_download_url -OutFile $licensePath -UseBasicParsing
 
-            # Install dependencies first
             Write-Verbose "Installing VCLibs..."
             Add-AppxPackage -Path $vclibsPath -ErrorAction SilentlyContinue
 
             Write-Verbose "Installing UI.Xaml..."
             Add-AppxPackage -Path $uiXamlAppxPath -ErrorAction SilentlyContinue
 
-            # Install winget with license (provisioned for all users)
             Write-Verbose "Installing WinGet package with license..."
             try {
                 Add-AppxProvisionedPackage -Online -PackagePath $bundlePath -LicensePath $licensePath -DependencyPackagePath $uiXamlAppxPath, $vclibsPath -ErrorAction Stop | Out-Null
@@ -437,7 +845,12 @@ try {
 
             Start-Sleep -Seconds 3
 
-            if (Test-WinGetExists) {
+            # Provisioning stages the package but does not register it for the
+            # calling identity - this is precisely the state that produces
+            # Win32 1920 on the next run. Register before probing.
+            [void](Repair-WinGetRegistration)
+
+            if ((Test-WinGetFunctional).Working) {
                 Write-Success "WinGet installed via GitHub release download."
                 $installSuccess = $true
             }
@@ -459,11 +872,11 @@ try {
             Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile $bundlePath -UseBasicParsing
 
             Add-AppxPackage -Path $bundlePath -ErrorAction Stop
-            Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction SilentlyContinue
+            Add-AppxPackage -RegisterByFamilyName -MainPackage $script:WinGetFamilyName -ErrorAction SilentlyContinue
 
             Start-Sleep -Seconds 3
 
-            if (Test-WinGetExists) {
+            if ((Test-WinGetFunctional).Working) {
                 Write-Success "WinGet installed via aka.ms/getwinget"
                 $installSuccess = $true
             }
@@ -473,7 +886,14 @@ try {
     }
 
     if (-not $installSuccess) {
-        Write-Fail "All installation methods failed. See warnings above for details."
+        # Binaries may still be on disk with a broken registration; report which.
+        if (Test-WinGetExists) {
+            Write-Fail "WinGet binaries are present but could not be made runnable."
+            $final = Test-WinGetFunctional
+            Write-Host "  Last failure: $($final.FailureReason)" -ForegroundColor Gray
+        } else {
+            Write-Fail "All installation methods failed. See warnings above for details."
+        }
         Remove-TempFolder -Path $tempFolder
         exit 1
     }
@@ -490,7 +910,6 @@ if (-not $SkipSourceFix) {
     Write-Step "Registering WinGet Source packages."
 
     try {
-        # Method A: Download and install source.msix from CDN
         Write-Info "Installing source.msix from CDN..."
         try {
             Add-AppxPackage -Path "https://cdn.winget.microsoft.com/cache/source.msix" -ErrorAction Stop
@@ -499,7 +918,6 @@ if (-not $SkipSourceFix) {
             Write-Verbose "CDN source.msix install failed: $($_.Exception.Message)"
         }
 
-        # Method B: Re-register existing Winget.Source manifests (fixes 0x8a15000f)
         Write-Info "Re-registering existing WinGet Source manifests..."
         $manifests = Get-ChildItem "C:\Program Files\WindowsApps\Microsoft.Winget.Source_*\AppXManifest.xml" -ErrorAction SilentlyContinue
         foreach ($manifest in $manifests) {
@@ -511,7 +929,6 @@ if (-not $SkipSourceFix) {
             }
         }
 
-        # Method C: Register by family name
         Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.Winget.Source_8wekyb3d8bbwe -ErrorAction SilentlyContinue
 
         Write-Success "WinGet Source registration complete."
@@ -527,17 +944,15 @@ if (-not $SkipSourceFix) {
 
 Write-Step "Configuring permissions and PATH."
 
-$wingetFolder = Get-WinGetExePath
+$wingetPkg = Get-WinGetPackage
 
-if ($wingetFolder) {
-    Write-Verbose "WinGet folder: $wingetFolder"
+if ($wingetPkg) {
+    Write-Verbose "WinGet folder: $($wingetPkg.InstallLocation)"
 
-    # Fix permissions
-    Set-WinGetFolderPermissions -FolderPath $wingetFolder
+    Set-WinGetFolderPermissions -FolderPath $wingetPkg.InstallLocation
     Write-Success "Permissions configured."
 
-    # Add to PATH
-    Add-WinGetToPath -WinGetFolder $wingetFolder
+    Add-WinGetToPath -WinGetFolder $wingetPkg.InstallLocation
     Write-Success "PATH configured."
 } else {
     Write-Warning "Could not locate WinGet folder in WindowsApps. PATH not updated."
@@ -549,34 +964,47 @@ if ($wingetFolder) {
 
 Write-Step "Verification"
 
-# Refresh PATH for current session
-$env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ";" + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+# Refresh PATH for current session, keeping the resolved package folder first.
+$machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+$userPath    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+$env:PATH    = (@($wingetPkg.InstallLocation, $machinePath, $userPath) |
+                Where-Object { $_ }) -join ';'
 
 Start-Sleep -Seconds 2
 
-if (Test-WinGetCommand) {
-    $wingetVer = & winget.exe --version 2>$null
-    Write-Success "WinGet is installed and recognized as a command (version: $wingetVer)"
+$finalState = Test-WinGetFunctional
 
-    # Quick source test
+if ($finalState.Working) {
+    Write-Success "WinGet is installed and runnable (version: $($finalState.Version))"
+    Write-Host "  Resolved via [$($finalState.Kind)]: $($finalState.ExePath)" -ForegroundColor Gray
+
     Write-Info "Testing winget source..."
-    try {
-        $sourceOutput = & winget.exe source list 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Success "WinGet sources are working."
-            Write-Host "Sources:`n$sourceOutput" -ForegroundColor Gray
-        } else {
-            Write-Warning "WinGet sources may need attention. Try: winget source reset --force"
-        }
-    } catch {
-        Write-Warning "Could not verify sources. Try: winget source reset --force"
+    $sourceRun = Invoke-WinGetProcess -ExePath $finalState.ExePath `
+                                      -Arguments @('source', 'list', '--disable-interactivity') `
+                                      -TimeoutSeconds 90
+
+    if ($sourceRun.Ran -and $sourceRun.ExitCode -eq 0) {
+        Write-Success "WinGet sources are working."
+        Write-Host "Sources:`n$($sourceRun.StdOut)" -ForegroundColor Gray
+    } else {
+        $detail = if ($sourceRun.ErrorMessage) { $sourceRun.ErrorMessage } else { "exit code $($sourceRun.ExitCode)" }
+        Write-Warning "WinGet sources may need attention ($detail). Try: winget source reset --force"
     }
-} elseif (Test-WinGetExists) {
-    $wingetFolder = Get-WinGetExePath
-    Write-Warning "WinGet is installed at '$wingetFolder' but not yet recognized as a command."
-    Write-Warning "Please restart your PowerShell session or computer, then try 'winget --version'."
-    Write-Host "`nAs a workaround, you can run winget directly:" -ForegroundColor Yellow
-    Write-Host "  & '$wingetFolder\winget.exe' --version" -ForegroundColor Yellow
+
+    if ($finalState.Kind -ne 'Alias' -and -not $finalState.IsSystemContext) {
+        Write-Host "  Note: resolved via the package path rather than the App Execution Alias." -ForegroundColor Gray
+        Write-Host "  Sign out and back in for 'winget' to work as a bare command in new shells." -ForegroundColor Gray
+    }
+} elseif ($finalState.BinaryPresent) {
+    Write-Warning "WinGet is installed at '$($wingetPkg.InstallLocation)' but is not runnable in this context."
+    Write-Warning "Reason: $($finalState.FailureReason)"
+    foreach ($attempt in $finalState.Attempts) {
+        Write-Host ("  [{0}] {1} -> ran={2} exit={3} win32={4}" -f `
+            $attempt.Kind, $attempt.Path, $attempt.Ran, $attempt.ExitCode, $attempt.NativeErrorCode) -ForegroundColor Gray
+    }
+    Write-Host "`nWorkaround - invoke winget by full path:" -ForegroundColor Yellow
+    Write-Host "  & '$($wingetPkg.ExePath)' --version" -ForegroundColor Yellow
+    exit 1
 } else {
     Write-Fail "WinGet installation could not be verified."
     Write-Host "Try restarting your computer and running this script again with -Force." -ForegroundColor Yellow
