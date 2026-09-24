@@ -5,7 +5,7 @@
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207.x-5391FE?logo=powershell&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Server%202016%2B-0078D6?logo=windows&logoColor=white)
 
-This repository collects scripts I use in day-to-day Windows administration. They cover security hardening and CVE mitigations, TLS/Schannel auditing, RDP hardening, WinGet deployment and repair, Windows Update troubleshooting, and reporting. Most scripts are standalone `.ps1` files. You can run them one at a time, and they have no dependencies on each other.
+This repository collects scripts I use in day-to-day Windows administration. They cover security hardening and CVE mitigations, TLS/Schannel auditing, RDP hardening, WinGet deployment and repair, Windows Update troubleshooting, and reporting. Most scripts are standalone `.ps1` files that you can run one at a time. There are two exceptions: the Excel report scripts need the `ImportExcel` module, and `Test-DownloadSpeed_NaitiveAPI.ps1` needs `WinHttpHelper.cs` in the same folder.
 
 ---
 
@@ -29,18 +29,22 @@ This repository collects scripts I use in day-to-day Windows administration. The
 git clone https://github.com/cquresphere/WindowsInternals.git
 cd WindowsInternals
 
-# 2. Unblock the downloaded files (removes the Mark-of-the-Web)
-Get-ChildItem -Recurse -Filter *.ps1 | Unblock-File
-
-# 3. Allow local scripts for the current session only
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-
-# 4. Read the script's help before running it
+# 2. Review the script before running it: read the source and its help
+Get-Content .\Security\Test-SchannelSecurity.ps1
 Get-Help .\Security\Test-SchannelSecurity.ps1 -Full
 
-# 5. Run it (most scripts need an elevated session)
+# 3. Run it from an elevated session (most scripts need one)
 .\Security\Test-SchannelSecurity.ps1 -OutputFormat HTML
 ```
+
+If your execution policy blocks a script that you've reviewed, you can unblock that one file. This is optional:
+
+```powershell
+Unblock-File -Path .\Security\Test-SchannelSecurity.ps1
+```
+
+> [!IMPORTANT]
+> Execution policy is [not a security boundary](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_execution_policies). It prevents accidental execution, but it doesn't protect you from malicious code. Unblock only scripts that you have read and that came from a source you trust. Don't bulk-unblock the whole repository or disable execution policy checks as a routine step.
 
 > [!TIP]
 > Scripts that declare `SupportsShouldProcess` accept `-WhatIf`. Use it to see what the script would change before you apply it. These include `Invoke-RDPHardening.ps1`, `Harden-SchannelSecurity-MS.ps1` and `Repair-WinGetSources.ps1`.
@@ -53,6 +57,9 @@ Get-Help .\Security\Test-SchannelSecurity.ps1 -Full
 | PowerShell | Windows PowerShell 5.1. Many scripts also run on PowerShell 7.x |
 | Privileges | Most scripts change HKLM, services or system features, so run them as **Administrator** |
 | Optional modules | [`ImportExcel`](https://www.powershellgallery.com/packages/ImportExcel), used by the Excel report scripts |
+
+> [!NOTE]
+> Compatibility varies by script. Some cmdlets and properties, such as newer SMB configuration options and the WinGet/AppX tooling, aren't available on every OS and PowerShell combination listed above. Check the script's header and test on your target platform.
 
 ## Script catalog
 
@@ -146,11 +153,14 @@ Legend: 🔍 read-only / reporting · 🛠️ changes system configuration · �
 
 ## Repository conventions
 
+Scripts are organized in one folder per technology area (`Security`, `Network`, `RDP`, `WinGet`, …).
+
+The following standards apply to **new and modernized scripts**. Many older scripts don't meet them yet. [ROADMAP.md](ROADMAP.md) tracks the retrofit work.
+
 - **Naming:** `Verb-Noun.ps1` with [approved PowerShell verbs](https://learn.microsoft.com/powershell/scripting/developer/cmdlet/approved-verbs-for-windows-powershell-commands).
-- **Layout:** one folder per technology area (`Security`, `Network`, `RDP`, `WinGet`, …).
-- **Help:** new scripts include comment-based help (`.SYNOPSIS`, `.DESCRIPTION`, `.PARAMETER`, `.EXAMPLE`, `.LINK`).
-- **Safety:** scripts that make changes use `[CmdletBinding(SupportsShouldProcess)]` and `#Requires -RunAsAdministrator`.
-- **Output:** reporting scripts return objects so you can pipe them to `Export-Csv`, `ConvertTo-Json` or `Export-Excel`.
+- **Help:** include comment-based help (`.SYNOPSIS`, `.DESCRIPTION`, `.PARAMETER`, `.EXAMPLE`, `.LINK`).
+- **Safety:** scripts that make changes should use `[CmdletBinding(SupportsShouldProcess)]` and `#Requires -RunAsAdministrator`.
+- **Output:** reporting scripts should return objects so you can pipe them to `Export-Csv`, `ConvertTo-Json` or `Export-Excel`.
 
 ## Roadmap
 
@@ -164,6 +174,9 @@ Issues and pull requests are welcome. When you contribute a script:
 2. Run [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) with no errors: `Invoke-ScriptAnalyzer -Path .\YourScript.ps1`.
 3. Say in the PR which Windows and PowerShell versions you tested on.
 4. Add the script to the [catalog](#script-catalog) in this README.
+
+> [!NOTE]
+> The repository has no CI yet, so linting and link checks are manual. Phase 0 of the [roadmap](ROADMAP.md) adds automated PSScriptAnalyzer checks.
 
 ## Disclaimer
 

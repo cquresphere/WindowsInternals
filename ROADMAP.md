@@ -46,7 +46,6 @@ _Last reviewed: 2026-09_
 |---|---|
 | `Network/Disable-IPv6.ps1` | Calls `Test-RegistryValue`, which is never defined, so the script fails at runtime |
 | `Network/Download/Test-DownloadSpeed_InvokeRestMethod.ps1` | Checks `$PathToCSFile`, which is undefined (copy-paste leftover) |
-| `Network/Download/*_NaitiveAPI.ps1`, `*_InvokeRestMethod.ps1` | `if(-not-(Test-Path …))` only works by accident; it should be `-not (Test-Path …)` |
 | `Update/Fix-UpdateError0x800f0922.ps1` | The failure banner prints `$RemovedPackages` instead of `$ErrorPackages`. `$null -ne @()` is always true, so both banners always print. The script also overwrites the automatic `$matches` variable |
 | `BitLocker/Get-BitLockerStatus.ps1` | Tries to `Install-Module BitLocker`, but that module ships with Windows and isn't in the Gallery. With more than one volume, the `-eq` comparisons run against arrays and give wrong results |
 | `Security/Disable-CachedLogonCredential.ps1` | No elevation check and no confirmation, although the change affects offline logon |
@@ -60,6 +59,7 @@ _Last reviewed: 2026-09_
 - [ ] Add a `LICENSE` (MIT recommended for script collections).
 - [ ] Fix the confirmed bugs listed above.
 - [ ] Remove `Install-WinGetUltimate.ps1.bak` (git history keeps it). Rename `Set-ProcMonAltitude` to `Diagnostics/Set-ProcMonAltitude.ps1`.
+- [ ] Readability cleanup: `if(-not-(Test-Path …))` in `Network/Download/*_NaitiveAPI.ps1` and `*_InvokeRestMethod.ps1` is valid PowerShell but hard to read. Rewrite it as `if (-not (Test-Path …))`.
 - [ ] Fix the file-name typos. Consider approved verbs in names (`Fix-` → `Repair-`, `Check-` → `Test-`, `Mitigate-`/`Harden-` → `Set-`/`Enable-`/`Protect-`).
 - [ ] Add `.gitignore`, `.editorconfig` (UTF-8 with BOM for PS 5.1 compatibility, CRLF), and `PSScriptAnalyzerSettings.psd1`.
 - [ ] Add `templates/Script-Template.ps1` with the standard skeleton: comment-based help, `#Requires`, `CmdletBinding(SupportsShouldProcess)`, parameters, logging and object output.
